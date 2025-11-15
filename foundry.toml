@@ -1,2 +1,28 @@
-[profile.ci.fuzz]
-runs = 10_000
+[profile.default]
+solc_version = "0.8.24"
+src = "src"
+out = "out"
+test = "test"
+libs = ["lib"]
+optimizer = true
+optimizer_runs = 20000
+via_ir = true
+ffi = false
+bytecode_hash = "none"
+
+remappings = [
+    "forge-std/=lib/forge-std/src/",
+    "@solmate/=lib/solmate/src/",
+    "ds-test/=lib/forge-std/lib/ds-test/src/",
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/"
+]
+
+gas_reports = ["*"]
+
+[profile.default.fuzz]
+runs = 256
+
+[profile.default.invariant]
+runs = 64
+depth = 15
+fail_on_revert = false

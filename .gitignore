@@ -1,2 +1,33 @@
-cache/
+```
+# Build & cache
 out/
+cache/
+dist/
+build/
+
+# Dependencies
+lib/
+node_modules/
+
+# Environment
+.env*
+!.env.example
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# System files
+.DS_Store
+Thumbs.db
+*~
+.directory
+
+# Logs & misc
+*.log
+*.tmp
+coverage/
+.nyc_output/
+```
