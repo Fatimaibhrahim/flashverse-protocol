@@ -1,210 +1,460 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+// ============================================================
+//  FlashVerse – FlashVerseToken Foundry Tests
+//
+//  Run all:    forge test --match-contract FlashVerseTokenTest -vv
+//  Run fuzz:   forge test --match-test testFuzz -vv
+// ============================================================
+
 import "forge-std/Test.sol";
 import "../src/FlashVerseToken.sol";
-import "./helpers/FlashBorrower.sol";
-import "./helpers/ReentrantBorrower.sol";
-import "./helpers/MaliciousBorrower.sol"; // Added MaliciousBorrower import
+import "@openzeppelin/contracts/interfaces/IERC3156FlashBorrower.sol";
 
-/**
- * @title FlashVerseToken Test Suite
- * @notice Comprehensive test suite for FlashVerseToken contract, covering basic functionality,
- * anti-whale mechanisms, vesting, and flash loans. Designed to be clean, organized,
- * and professional, following Solidity best practices.
- * @dev Uses Foundry's Test framework for unit testing. Assumes FlashVerseToken and helper
- * contracts are correctly implemented. Helpers are used for complex interactions like
- * flash loans to ensure test isolation and reusability.
- */
+// ── Mock Flash Borrower ───────────────────────────────────────────────────────
+contract MockFlashBorrower is IERC3156FlashBorrower {
+    bytes32 public constant CALLBACK_SUCCESS = keccak256("ERC3156FlashBorrower.onFlashLoan");
+    bool public shouldFail;
+
+    constructor(bool _shouldFail) { shouldFail = _shouldFail; }
+
+    function onFlashLoan(
+        address,
+        address token,
+        uint256 amount,
+        uint256 fee,
+        bytes calldata
+    ) external override returns (bytes32) {
+        if (shouldFail) return bytes32(0);
+        // Approve repayment
+        IERC20(token).approve(msg.sender, amount + fee);
+        return CALLBACK_SUCCESS;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  MAIN TEST CONTRACT
+// ─────────────────────────────────────────────────────────────────────────────
+
 contract FlashVerseTokenTest is Test {
-    // Constants for better readability and maintainability
-    uint256 constant INITIAL_SUPPLY = 1_000_000 ether;
-    uint256 constant MAX_TX_PERCENT = 1000; // 10% in basis points (1000 = 10%)
-    uint256 constant MAX_TX_AMOUNT = (INITIAL_SUPPLY * MAX_TX_PERCENT) / 10_000; // Calculated as 100_000 ether
 
-    // Test addresses
-    // CORRECTED: Changed from constant to public variable and assigned in setUp
-    address public OWNER; 
-    address constant ALICE = address(0x1);
-    address constant BOB = address(0x2);
+    FlashVerseToken public token;
 
-    // Contract instance
-    FlashVerseToken token;
+    address owner    = address(this);
+    address alice    = makeAddr("alice");
+    address bob      = makeAddr("bob");
+    address stranger = makeAddr("stranger");
 
-    /**
-     * @notice Setup function to initialize the token and perform initial transfers.
-     * @dev Deploys FlashVerseToken with initial supply and max tx limit, then transfers to alice.
-     */
+    uint256 constant TOTAL_SUPPLY  = 18_000_000_000 ether;
+    uint256 constant MAX_TX_BPS    = 100; // 1% of supply
+    uint256 constant MAX_TX_AMOUNT = (TOTAL_SUPPLY * MAX_TX_BPS) / 10_000;
+
     function setUp() public {
-        // CORRECTED: Set OWNER address here
-        OWNER = address(this);
-        
         token = new FlashVerseToken(
-            "FlashVerse",
+            "Flash Token",
             "FLASH",
-            INITIAL_SUPPLY,
-            MAX_TX_PERCENT
+            TOTAL_SUPPLY,
+            MAX_TX_BPS
         );
-
-        // Transfer initial amount to alice for testing
-        token.transfer(ALICE, 100_000 ether);
     }
 
-    /*//////////////////////////////////////////////////////////////
-                            BASIC FUNCTIONALITY TESTS
-    //////////////////////////////////////////////////////////////*/
-
-    /**
-     * @notice Test that the initial supply is correctly minted to the owner.
-     */
-    function testInitialSupplyMintedToOwner() public {
-        uint256 expectedBalance = INITIAL_SUPPLY - 100_000 ether; // After transfer to alice
-        assertEq(token.balanceOf(OWNER), expectedBalance);
+    // ─────────────────────────────────────────
+    //  1. Deployment
+    // ─────────────────────────────────────────
+    function test_InitialSupply() public view {
+        assertEq(token.totalSupply(), TOTAL_SUPPLY);
+        assertEq(token.balanceOf(owner), TOTAL_SUPPLY);
     }
 
-    /**
-     * @notice Test anti-whale mechanism: transfers exceeding maxTxAmount should revert.
-     * @dev Uses prank to simulate transfer from a regular user (alice), not owner.
-     */
-    function testAntiWhaleLimit() public {
-        vm.prank(ALICE);
-        vm.expectRevert("Anti-whale: exceeds maxTxAmount");
-        token.transfer(BOB, 200_000 ether); // Exceeds 100_000 ether limit
+    function test_TokenMetadata() public view {
+        assertEq(token.name(),     "Flash Token");
+        assertEq(token.symbol(),   "FLASH");
+        assertEq(token.decimals(), 18);
     }
 
-    /**
-     * @notice Test that the owner can update the maxTxAmount and perform larger transfers.
-     */
-    function testOwnerCanUpdateMaxTx() public {
-        token.setMaxTxAmount(500_000 ether);
-        token.transfer(BOB, 200_000 ether);
-        assertEq(token.balanceOf(BOB), 200_000 ether);
+    function test_MaxTxAmount() public view {
+        assertEq(token.maxTxAmount(), MAX_TX_AMOUNT);
     }
 
-    /*//////////////////////////////////////////////////////////////
-                            VESTING TESTS
-    //////////////////////////////////////////////////////////////*/
+    function test_OwnerIsExemptByDefault() public view {
+        assertTrue(token.isExempt(owner));
+        assertTrue(token.isExempt(address(token)));
+    }
 
-    /**
-     * @notice Test the full vesting flow: setup, time passage, and claiming.
-     */
-    function testVestingFlow() public {
-        uint256 start = block.timestamp + 1 days;
-        uint256 cliff = 30 days;
+    function test_OwnerIsDeployer() public view {
+        assertEq(token.owner(), owner);
+    }
+
+    // ─────────────────────────────────────────
+    //  2. Anti-Whale
+    // ─────────────────────────────────────────
+    function test_TransferWithinLimit() public {
+        token.transfer(alice, MAX_TX_AMOUNT);
+        assertEq(token.balanceOf(alice), MAX_TX_AMOUNT);
+    }
+
+    function test_RevertTransferAboveLimit() public {
+        uint256 overLimit = MAX_TX_AMOUNT + 1;
+        // First give alice enough tokens via exempt owner
+        token.transfer(alice, overLimit);
+
+        // Now alice tries to send above limit (alice not exempt)
+        vm.prank(alice);
+        token.approve(owner, overLimit);
+
+        vm.expectRevert(abi.encodeWithSelector(ExceedsMaxTx.selector, overLimit, MAX_TX_AMOUNT));
+        vm.prank(alice);
+        token.transfer(bob, overLimit);
+    }
+
+    function test_ExemptAddressCanTransferAboveLimit() public {
+        uint256 bigAmount = MAX_TX_AMOUNT * 10;
+        // Owner is exempt — should work
+        token.transfer(alice, bigAmount);
+        assertEq(token.balanceOf(alice), bigAmount);
+    }
+
+    function test_SetExempt() public {
+        token.setExempt(alice, true);
+        assertTrue(token.isExempt(alice));
+
+        // Give alice big amount first via exempt owner
+        uint256 bigAmount = MAX_TX_AMOUNT * 5;
+        token.transfer(alice, bigAmount);
+
+        // Alice (now exempt) can send above limit
+        vm.prank(alice);
+        token.transfer(bob, bigAmount);
+        assertEq(token.balanceOf(bob), bigAmount);
+    }
+
+    function test_RemoveExemption() public {
+        token.setExempt(alice, true);
+        token.setExempt(alice, false);
+        assertFalse(token.isExempt(alice));
+    }
+
+    function test_BatchSetExempt() public {
+        address[] memory accounts = new address[](3);
+        accounts[0] = alice;
+        accounts[1] = bob;
+        accounts[2] = stranger;
+
+        token.batchSetExempt(accounts, true);
+
+        assertTrue(token.isExempt(alice));
+        assertTrue(token.isExempt(bob));
+        assertTrue(token.isExempt(stranger));
+    }
+
+    function test_RevertSetExemptIfNonOwner() public {
+        vm.prank(stranger);
+        vm.expectRevert();
+        token.setExempt(alice, true);
+    }
+
+    function test_SetMaxTxAmount() public {
+        uint256 newMax = MAX_TX_AMOUNT * 2;
+        token.setMaxTxAmount(newMax);
+        assertEq(token.maxTxAmount(), newMax);
+    }
+
+    function test_RevertSetMaxTxBelowFloor() public {
+        vm.expectRevert();
+        token.setMaxTxAmount(0);
+    }
+
+    function test_RevertSetExemptZeroAddress() public {
+        vm.expectRevert(ZeroAddress.selector);
+        token.setExempt(address(0), true);
+    }
+
+    // ─────────────────────────────────────────
+    //  3. Vesting
+    // ─────────────────────────────────────────
+    function test_SetVesting() public {
+        uint256 amount   = 1_000_000 ether;
+        uint256 start    = block.timestamp;
+        uint256 cliff    = 30 days;
         uint256 duration = 180 days;
-        uint256 vestedAmount = 10_000 ether;
 
-        // Setup vesting for alice
-        token.setVesting(ALICE, vestedAmount, start, cliff, duration);
+        token.setVesting(alice, amount, start, cliff, duration);
 
-        // Warp time to after cliff + some days
-        vm.warp(start + cliff + 10 days);
+        (uint256 total, uint256 claimed, uint256 s, uint256 c, uint256 d) = token.vestings(alice);
+        assertEq(total,   amount);
+        assertEq(claimed, 0);
+        assertEq(s,       start);
+        assertEq(c,       cliff);
+        assertEq(d,       duration);
+        assertEq(token.balanceOf(address(token)), amount);
+    }
 
-        // Claim vested tokens
-        vm.prank(ALICE);
+    function test_ClaimVestedAfterFullDuration() public {
+        uint256 amount   = 1_000_000 ether;
+        uint256 start    = block.timestamp;
+        uint256 cliff    = 0;
+        uint256 duration = 180 days;
+
+        token.setVesting(alice, amount, start, cliff, duration);
+
+        // Advance past duration
+        vm.warp(block.timestamp + 180 days + 1);
+
+        vm.prank(alice);
         token.claimVested();
 
-        // Verify alice's balance increased due to vesting (beyond initial 100_000 ether)
-        uint256 claimed = token.balanceOf(ALICE);
-        assertGt(claimed, 100_000 ether);
+        assertEq(token.balanceOf(alice), amount);
     }
 
-    /**
-     * @notice Test claiming before cliff: should not allow claiming.
-     * @dev Assumes the contract reverts with "Nothing to claim" if claimable is 0.
-     */
-    function testVestingClaimBeforeCliff() public {
-        uint256 start = block.timestamp + 1 days;
-        uint256 cliff = 30 days;
+    function test_ClaimVestedLinearlyAfterCliff() public {
+        uint256 amount   = 1_000_000 ether;
+        uint256 start    = block.timestamp;
+        uint256 cliff    = 30 days;
         uint256 duration = 180 days;
 
-        token.setVesting(ALICE, 10_000 ether, start, cliff, duration);
+        token.setVesting(alice, amount, start, cliff, duration);
 
-        // Warp to just before cliff
-        vm.warp(start + cliff - 1 days);
+        // Advance to halfway through vesting period after cliff
+        vm.warp(block.timestamp + 30 days + 75 days); // cliff + half of remaining
 
-        vm.prank(ALICE);
-        vm.expectRevert("Nothing to claim");
+        uint256 vested = token.vestedAmount(alice);
+        assertGt(vested, 0);
+        assertLt(vested, amount);
+
+        vm.prank(alice);
+        token.claimVested();
+        assertGt(token.balanceOf(alice), 0);
+    }
+
+    function test_RevertClaimBeforeCliff() public {
+        uint256 amount = 1_000_000 ether;
+        token.setVesting(alice, amount, block.timestamp, 30 days, 180 days);
+
+        vm.prank(alice);
+        vm.expectRevert(NothingToClaim.selector);
         token.claimVested();
     }
 
-    /**
-     * @notice Test removing vesting: should reset vesting data.
-     */
-    function testRemoveVesting() public {
-        token.setVesting(ALICE, 10_000 ether, block.timestamp, 0, 100 days);
-        token.removeVesting(ALICE);
+    function test_RevertClaimIfNoVesting() public {
+        vm.prank(alice);
+        vm.expectRevert(NoVesting.selector);
+        token.claimVested();
+    }
 
-        (uint256 total, , , , ) = token.vestings(ALICE);
+    function test_RemoveVesting() public {
+        uint256 amount = 1_000_000 ether;
+        token.setVesting(alice, amount, block.timestamp, 0, 180 days);
+
+        uint256 ownerBefore = token.balanceOf(owner);
+        token.removeVesting(alice);
+
+        assertEq(token.balanceOf(owner), ownerBefore + amount);
+        (uint256 total,,,,) = token.vestings(alice);
         assertEq(total, 0);
     }
 
-    /*//////////////////////////////////////////////////////////////
-                            FLASH LOAN TESTS
-    //////////////////////////////////////////////////////////////*/
-
-    /**
-     * @notice Test successful flash loan execution.
-     * @dev Assumes FlashBorrower repays the loan amount + fee correctly.
-     */
-    function testFlashLoanSuccess() public {
-        // Note: The FlashBorrower contract uses 'address payable' in its constructor
-        FlashBorrower borrower = new FlashBorrower(payable(address(token)));
-        uint256 initialBorrowerBalance = 1_000 ether;
-        uint256 loanAmount = 10_000 ether;
-
-        // Fund borrower
-        token.transfer(address(borrower), initialBorrowerBalance);
-
-        // Execute flash loan
-        vm.prank(address(borrower));
-        borrower.executeFlashLoan(loanAmount);
-
-        // Verify borrower balance is at least the initial amount (assuming repayment covers loan + fee)
-        assertGe(token.balanceOf(address(borrower)), initialBorrowerBalance);
+    function test_RevertRemoveVestingIfNone() public {
+        vm.expectRevert(NoVesting.selector);
+        token.removeVesting(alice);
     }
 
-    /**
-     * @notice Test that reentrancy attacks on flash loans are blocked.
-     * @dev Uses OpenZeppelin's ReentrancyGuard revert message.
-     */
-    function testFlashLoanReentrancyBlocked() public {
-        ReentrantBorrower attacker = new ReentrantBorrower(payable(address(token)));
-        uint256 loanAmount = 10_000 ether;
+    function test_ClaimableAmountView() public {
+        uint256 amount = 1_000_000 ether;
+        token.setVesting(alice, amount, block.timestamp, 0, 180 days);
 
-        // Fund attacker
-        token.transfer(address(attacker), 1_000 ether);
+        assertEq(token.claimableAmount(alice), 0); // nothing yet
 
-        // Expect revert due to reentrancy guard
-        vm.expectRevert("ReentrancyGuard: reentrant call");
-        attacker.attack(loanAmount);
+        vm.warp(block.timestamp + 180 days + 1);
+        assertEq(token.claimableAmount(alice), amount);
     }
 
-    /**
-     * @notice Test flash loan failure due to insufficient repayment.
-     * @dev Uses FlashBorrower to simulate failure.
-     */
-    function testFlashLoanFailure() public {
-        FlashBorrower borrower = new FlashBorrower(payable(address(token)));
-        token.transfer(address(borrower), 1_000 ether);
-
-        vm.prank(address(borrower));
-        // Expect revert because the borrower is designed to fail repayment
-        vm.expectRevert(); 
-        borrower.executeFlashLoanWithFailure(10_000 ether);
+    function test_RevertVestingCliffExceedsDuration() public {
+        vm.expectRevert(CliffExceedsDuration.selector);
+        token.setVesting(alice, 1_000 ether, block.timestamp, 200 days, 100 days);
     }
 
-    /**
-     * @notice Test flash loan failure due to malicious non-repayment.
-     * @dev Uses MaliciousBorrower to simulate malicious failure (incorrect return value/no repayment).
-     */
-    function testFlashLoanMaliciousFailure() public {
-        MaliciousBorrower malicious = new MaliciousBorrower(payable(address(token)));
-        token.transfer(address(malicious), 1_000 ether);
+    function test_RevertVestingZeroAddress() public {
+        vm.expectRevert(ZeroAddress.selector);
+        token.setVesting(address(0), 1_000 ether, block.timestamp, 0, 180 days);
+    }
 
-        vm.prank(address(malicious));
-        // Expect revert because the borrower is designed to fail repayment (using "malicious" flag)
-        vm.expectRevert(); 
-        malicious.executeMalicious(10_000 ether);
+    // ─────────────────────────────────────────
+    //  4. Flash Loans
+    // ─────────────────────────────────────────
+    function _fundTokenContract(uint256 amount) internal {
+        // Transfer tokens to contract for flash loan pool
+        token.transfer(address(token), amount);
+    }
+
+    function test_FlashLoan() public {
+        uint256 loanAmount = 1_000_000 ether;
+        _fundTokenContract(loanAmount * 2);
+
+        MockFlashBorrower borrower = new MockFlashBorrower(false);
+        // Fund borrower with fee
+        uint256 fee = (loanAmount * token.flashLoanFeeBP()) / 10_000;
+        token.transfer(address(borrower), fee);
+
+        token.flashLoan(borrower, address(token), loanAmount, "");
+    }
+
+    function test_RevertFlashLoanCallbackFailed() public {
+        uint256 loanAmount = 1_000_000 ether;
+        _fundTokenContract(loanAmount * 2);
+
+        MockFlashBorrower badBorrower = new MockFlashBorrower(true);
+
+        vm.expectRevert(CallbackFailed.selector);
+        token.flashLoan(badBorrower, address(token), loanAmount, "");
+    }
+
+    function test_RevertFlashLoanUnsupportedToken() public {
+        MockFlashBorrower borrower = new MockFlashBorrower(false);
+        vm.expectRevert(abi.encodeWithSelector(UnsupportedToken.selector, alice));
+        token.flashLoan(borrower, alice, 1_000 ether, "");
+    }
+
+    function test_RevertFlashLoanInsufficientPool() public {
+        MockFlashBorrower borrower = new MockFlashBorrower(false);
+        vm.expectRevert();
+        token.flashLoan(borrower, address(token), 1_000_000 ether, "");
+    }
+
+    function test_MaxFlashLoan() public {
+        uint256 amount = 1_000_000 ether;
+        _fundTokenContract(amount);
+        assertEq(token.maxFlashLoan(address(token)), amount);
+        assertEq(token.maxFlashLoan(alice), 0);
+    }
+
+    function test_FlashFee() public view {
+        uint256 amount = 1_000_000 ether;
+        uint256 fee    = token.flashFee(address(token), amount);
+        assertEq(fee, (amount * 5) / 10_000);
+    }
+
+    function test_RevertFlashFeeUnsupportedToken() public {
+        vm.expectRevert(abi.encodeWithSelector(UnsupportedToken.selector, alice));
+        token.flashFee(alice, 1_000 ether);
+    }
+
+    function test_SetFlashLoanFee() public {
+        token.setFlashLoanFee(50); // 0.5%
+        assertEq(token.flashLoanFeeBP(), 50);
+    }
+
+    function test_RevertFlashLoanFeeTooHigh() public {
+        vm.expectRevert(abi.encodeWithSelector(FlashLoanFeeTooHigh.selector, 101, 100));
+        token.setFlashLoanFee(101);
+    }
+
+    // ─────────────────────────────────────────
+    //  5. Burn
+    // ─────────────────────────────────────────
+    function test_Burn() public {
+        uint256 burnAmount = 1_000_000 ether;
+        token.burn(burnAmount);
+        assertEq(token.totalSupply(), TOTAL_SUPPLY - burnAmount);
+    }
+
+    function test_BurnFrom() public {
+        uint256 burnAmount = 1_000_000 ether;
+        token.transfer(alice, burnAmount);
+        vm.prank(alice);
+        token.approve(owner, burnAmount);
+        token.burnFrom(alice, burnAmount);
+        assertEq(token.balanceOf(alice), 0);
+    }
+
+    // ─────────────────────────────────────────
+    //  6. Recover
+    // ─────────────────────────────────────────
+    function test_RecoverERC20() public {
+        // Deploy a random token and send to FLASH contract
+        FlashVerseToken random = new FlashVerseToken("R", "R", 1_000 ether, 10_000);
+        random.transfer(address(token), 500 ether);
+        token.recoverERC20(address(random), 500 ether, alice);
+        assertEq(random.balanceOf(alice), 500 ether);
+    }
+
+    function test_RevertRecoverSelf() public {
+        vm.expectRevert(CannotRecoverSelf.selector);
+        token.recoverERC20(address(token), 100, alice);
+    }
+
+    function test_RecoverETH() public {
+        vm.deal(address(token), 1 ether);
+        uint256 before = alice.balance;
+        token.recoverETH(1 ether, alice);
+        assertEq(alice.balance, before + 1 ether);
+    }
+
+    function test_RevertRecoverETHZeroAddress() public {
+        vm.deal(address(token), 1 ether);
+        vm.expectRevert(ZeroAddress.selector);
+        token.recoverETH(1 ether, address(0));
+    }
+
+    // ─────────────────────────────────────────
+    //  7. Ownable2Step
+    // ─────────────────────────────────────────
+    function test_TransferOwnership2Step() public {
+        token.transferOwnership(alice);
+        // Ownership not transferred yet
+        assertEq(token.owner(), owner);
+        assertEq(token.pendingOwner(), alice);
+
+        // Alice accepts
+        vm.prank(alice);
+        token.acceptOwnership();
+        assertEq(token.owner(), alice);
+    }
+
+    function test_RevertAcceptOwnershipIfNotPending() public {
+        token.transferOwnership(alice);
+        vm.prank(bob);
+        vm.expectRevert();
+        token.acceptOwnership();
+    }
+
+    // ─────────────────────────────────────────
+    //  8. ERC20Votes
+    // ─────────────────────────────────────────
+    function test_Delegate() public {
+        token.transfer(alice, 1_000 ether);
+        vm.prank(alice);
+        token.delegate(alice);
+        assertEq(token.getVotes(alice), 1_000 ether);
+    }
+
+    // ─────────────────────────────────────────
+    //  9. Fuzz Tests
+    // ─────────────────────────────────────────
+    function testFuzz_TransferWithinLimit(uint256 amount) public {
+        amount = bound(amount, 1, MAX_TX_AMOUNT);
+        token.transfer(alice, amount * 2); // owner is exempt
+        vm.prank(alice);
+        // alice not exempt, so transfer must be within limit
+        token.transfer(bob, amount);
+        assertEq(token.balanceOf(bob), amount);
+    }
+
+    function testFuzz_VestingLinear(uint256 elapsed) public {
+        uint256 amount   = 1_000_000 ether;
+        uint256 duration = 180 days;
+        elapsed = bound(elapsed, duration, duration * 2);
+
+        token.setVesting(alice, amount, block.timestamp, 0, duration);
+        vm.warp(block.timestamp + elapsed);
+
+        uint256 vested = token.vestedAmount(alice);
+        assertEq(vested, amount); // fully vested after duration
+    }
+
+    function testFuzz_FlashLoanFee(uint256 amount) public {
+        amount = bound(amount, 1 ether, 1_000_000 ether);
+        uint256 fee = token.flashFee(address(token), amount);
+        assertEq(fee, (amount * token.flashLoanFeeBP()) / 10_000);
     }
 }

@@ -1,294 +1,576 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.24;
 
 /**
- * @title UniversalAirdropDistributor
- * @notice Professional, gas-optimized contract for distributing ERC20, ERC721, and ERC1155 tokens.
- * @dev Supports universal airdrops (any token type per call), batch distributions, emergency withdrawals, and multiple token types.
- * Uses OpenZeppelin utilities for security and efficiency.
+ * @title  UniversalAirdropDistributor v2.1
+ * @author FlashVerse Team
+ * @notice Production-grade contract for ERC20 / ERC721 / ERC1155 airdrops.
+ * Supports single, batch, and Merkle-proof-gated distributions.
+ *
+ * @dev    Architecture decisions:
+ * ─ OpenZeppelin v5 only (no external Merkle lib needed)
+ * ─ Custom errors  → cheaper gas than require strings
+ * ─ SafeERC20      → handles non-standard ERC20 tokens safely
+ * ─ ReentrancyGuard + Pausable → layered security
+ * ─ Merkle lane uses OZ MerkleProof (battle-tested, audited)
+ * ─ ERC721 gets its own batch function (different transfer semantics)
+ * ─ All leaf hashing: keccak256(keccak256(...)) to prevent second
+ * pre-image attacks (same pattern as OZ MerkleProof docs)
  */
 
-import "@openzeppelin/contracts/utils/Address.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
-import "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
-import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import {Ownable}         from "@openzeppelin/contracts/access/Ownable.sol";
+import {Pausable}        from "@openzeppelin/contracts/utils/Pausable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {MerkleProof}     from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+import {SafeERC20}       from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ERC721Holder}    from "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
+import {ERC1155Holder}   from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
+import {IERC20}          from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC721}         from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {IERC1155}        from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 
-contract UniversalAirdropDistributor is Ownable, ReentrancyGuard, ERC721Holder, ERC1155Holder {
+/*//////////////////////////////////////////////////////////////
+                        CUSTOM ERRORS
+//////////////////////////////////////////////////////////////*/
+
+error UAD__ZeroAddress();
+error UAD__ZeroAmount();
+error UAD__ZeroTokenId();
+error UAD__InvalidTokenType();
+error UAD__ArrayLengthMismatch();
+error UAD__BatchTooLarge(uint256 given, uint256 max);
+error UAD__BatchEmpty();
+error UAD__InsufficientBalance(address token, uint256 required, uint256 available);
+error UAD__NotTokenOwner(address token, uint256 tokenId);
+error UAD__ERC721AmountMustBeOne();
+error UAD__UseERC721BatchFunction();
+error UAD__UseEmergencyWithdrawForERC721();
+error UAD__NothingToWithdraw();
+error UAD__AlreadyClaimed(uint256 campaignId, address claimant);
+error UAD__InvalidMerkleProof();
+error UAD__CampaignNotActive();
+error UAD__MaxBatchMustBePositive();
+
+/*//////////////////////////////////////////////////////////////
+                    UNIVERSAL AIRDROP DISTRIBUTOR
+//////////////////////////////////////////////////////////////*/
+
+contract UniversalAirdropDistributor is
+    Ownable,
+    Pausable,
+    ReentrancyGuard,
+    ERC721Holder,
+    ERC1155Holder
+{
     using SafeERC20 for IERC20;
-    using Address for address;
 
+    /*//////////////////////////////////////////////////////////////
+                                TYPES
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Supported token standards
     enum TokenType { ERC20, ERC721, ERC1155 }
 
-    struct TokenInfo {
-        address tokenAddress;
-        TokenType tokenType;
+    /// @notice One entry in a batch airdrop
+    struct AirdropEntry {
+        address recipient; // Who receives
+        uint256 amount;    // ERC20 / ERC1155 quantity  |  ignored for ERC721
+        uint256 tokenId;   // ERC721 / ERC1155 token ID |  ignored for ERC20
     }
 
-    TokenInfo public tokenInfo; 
-    uint256 public maxBatchRecipients = 100;
+    /// @notice A registered Merkle drop campaign
+    struct MerkleCampaign {
+        address   token;
+        TokenType tokenType;
+        bytes32   root;
+        uint256   totalBudget;
+        uint256   claimed;
+        bool      active;
+    }
 
-    event AirdropExecuted(address indexed token, TokenType tokenType, address indexed recipient, uint256 amount, uint256 tokenId);
-    event BatchAirdropExecuted(address indexed token, TokenType tokenType, uint256 totalRecipients, uint256 totalAmount);
-    event ERC721BatchAirdropExecuted(address indexed token, uint256 totalRecipients, uint256 totalTokenIds);
-    event EmergencyWithdrawal(address indexed owner, address indexed token, TokenType tokenType, uint256 amount, uint256 tokenId);
-    event TokenInfoUpdated(address indexed newToken, TokenType tokenType);
-    event MaxBatchRecipientsUpdated(uint256 newMax);
+    /*//////////////////////////////////////////////////////////////
+                                STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Maximum recipients per batch call (gas-safety valve)
+    uint256 public maxBatchSize = 200;
+
+    /// @notice Merkle campaigns, keyed by campaign ID
+    mapping(uint256 => MerkleCampaign) public campaigns;
+    uint256 public nextCampaignId;
+
+    /// @notice campaignId => claimant => claimed?
+    mapping(uint256 => mapping(address => bool)) public hasClaimed;
+
+    /*//////////////////////////////////////////////////////////////
+                                EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event SingleAirdrop(
+        address   indexed token,
+        TokenType indexed tokenType,
+        address   indexed recipient,
+        uint256           amount,
+        uint256           tokenId
+    );
+
+    event BatchAirdrop(
+        address   indexed token,
+        TokenType indexed tokenType,
+        uint256           recipientCount,
+        uint256           totalAmount
+    );
+
+    event MerkleCampaignCreated(
+        uint256   indexed campaignId,
+        address   indexed token,
+        TokenType         tokenType,
+        bytes32           root,
+        uint256           totalBudget
+    );
+
+    event MerkleClaimed(
+        uint256 indexed campaignId,
+        address indexed claimant,
+        uint256         amount,
+        uint256         tokenId
+    );
+
+    event EmergencyWithdraw(
+        address   indexed token,
+        TokenType         tokenType,
+        address   indexed to,
+        uint256           amount,
+        uint256           tokenId
+    );
+
+    event MaxBatchSizeUpdated(uint256 oldMax, uint256 newMax);
+
+    /*//////////////////////////////////////////////////////////////
+                             CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice CONSTRUCTOR: Sets the initial owner and the default token type/address.
-     * @param initialOwner The address that will be the contract owner (inherits from Ownable).
+     * @param initialOwner Address that owns the contract.
      */
-    constructor(address initialOwner, address _tokenAddress, TokenType _tokenType) 
-        Ownable(initialOwner) // CORRECTED: Passes initialOwner to the Ownable base contract
+    constructor(address initialOwner) Ownable(initialOwner) {}
+
+    /*//////////////////////////////////////////////////////////////
+                        ADMIN: CONFIGURATION
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Update the per-call recipient cap.
+     * @param newMax Must be > 0.
+     */
+    function setMaxBatchSize(uint256 newMax) external onlyOwner {
+        if (newMax == 0) revert UAD__MaxBatchMustBePositive();
+        emit MaxBatchSizeUpdated(maxBatchSize, newMax);
+        maxBatchSize = newMax;
+    }
+
+    /// @notice Pause all state-changing functions (emergency brake).
+    function pause()   external onlyOwner { _pause();   }
+
+    /// @notice Resume operations.
+    function unpause() external onlyOwner { _unpause(); }
+
+    /*//////////////////////////////////////////////////////////////
+                        CORE: SINGLE AIRDROP
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Send tokens to one recipient.
+     *
+     * @param token      Token contract address.
+     * @param tokenType  ERC20 | ERC721 | ERC1155.
+     * @param recipient  Destination address.
+     * @param amount     ERC20 → quantity.
+     * ERC721 → must be 1 (auto-normalised).
+     * ERC1155 → quantity of `tokenId`.
+     * @param tokenId    ERC20 → ignored (pass 0).
+     * ERC721 / ERC1155 → the token ID to transfer.
+     */
+    function airdropSingle(
+        address   token,
+        TokenType tokenType,
+        address   recipient,
+        uint256   amount,
+        uint256   tokenId
+    )
+        external
+        onlyOwner
+        nonReentrant
+        whenNotPaused
     {
-        require(_tokenAddress != address(0), "Invalid token address");
-        require(_tokenType <= TokenType.ERC1155, "Invalid token type");
-        tokenInfo = TokenInfo(_tokenAddress, _tokenType);
-    }
-
-    function updateTokenInfo(address _tokenAddress, TokenType _tokenType) external onlyOwner {
-        require(_tokenAddress != address(0), "Invalid token address");
-        require(_tokenType <= TokenType.ERC1155, "Invalid token type");
-        tokenInfo = TokenInfo(_tokenAddress, _tokenType);
-        emit TokenInfoUpdated(_tokenAddress, _tokenType);
-    }
-
-    function setMaxBatchRecipients(uint256 _max) external onlyOwner {
-        require(_max > 0, "Max must be > 0");
-        maxBatchRecipients = _max;
-        emit MaxBatchRecipientsUpdated(_max);
-    }
-
-    function airdrop(
-        address tokenAddress,
-        TokenType tokenType,
-        address recipient,
-        uint256 amountOrTokenId,
-        uint256 tokenId
-    ) external onlyOwner nonReentrant {
-        require(tokenAddress != address(0), "Invalid token address");
-        require(recipient != address(0), "Zero address");
-        require(amountOrTokenId > 0, "Zero amount/id");
-        require(tokenType <= TokenType.ERC1155, "Invalid token type");
-
-        uint256 amount;
-        uint256 actualTokenId;
+        _validateToken(token, tokenType);
+        _validateRecipient(recipient);
 
         if (tokenType == TokenType.ERC20) {
-            amount = amountOrTokenId;
-            actualTokenId = 0;
-        } else if (tokenType == TokenType.ERC1155) {
-            amount = amountOrTokenId;
-            actualTokenId = tokenId;
-            require(actualTokenId > 0, "Token ID required for ERC1155");
-        } else { // ERC721
+            if (amount == 0) revert UAD__ZeroAmount();
+        } else if (tokenType == TokenType.ERC721) {
+            if (tokenId == 0) revert UAD__ZeroTokenId();
             amount = 1;
-            actualTokenId = amountOrTokenId;
-            require(actualTokenId > 0, "Token ID required for ERC721");
+        } else {
+            if (tokenId == 0) revert UAD__ZeroTokenId();
+            if (amount  == 0) revert UAD__ZeroAmount();
         }
 
-        _checkBalance(tokenAddress, tokenType, amount, actualTokenId);
-        _transferFromSenderToContract(tokenAddress, tokenType, amount, actualTokenId);
-        _transferFromContractToRecipient(tokenAddress, tokenType, recipient, amount, actualTokenId);
+        _pullFromSender(token, tokenType, amount, tokenId);
+        _pushToAddress(token, tokenType, recipient, amount, tokenId);
 
-        emit AirdropExecuted(tokenAddress, tokenType, recipient, amount, actualTokenId);
+        emit SingleAirdrop(token, tokenType, recipient, amount, tokenId);
     }
 
+    /*//////////////////////////////////////////////////////////////
+                CORE: BATCH AIRDROP (ERC20 / ERC1155)
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Send tokens to multiple recipients in one call.
+     * ERC721 must use `batchAirdropERC721` instead.
+     */
     function batchAirdrop(
-        address tokenAddress,
-        TokenType tokenType,
-        address[] calldata recipients,
-        uint256[] calldata amounts,
-        uint256[] calldata tokenIds
-    ) external onlyOwner nonReentrant {
-        require(tokenAddress != address(0), "Invalid token address");
-        require(tokenType == TokenType.ERC20 || tokenType == TokenType.ERC1155, "Use batchAirdropERC721 for ERC721");
-        uint256 length = recipients.length;
-        require(length == amounts.length, "Array length mismatch");
-        require(length > 0 && length <= maxBatchRecipients, "Invalid recipients count");
-        if (tokenType == TokenType.ERC1155) {
-            require(length == tokenIds.length, "TokenIds array length mismatch");
+        address            token,
+        TokenType          tokenType,
+        AirdropEntry[] calldata entries
+    )
+        external
+        onlyOwner
+        nonReentrant
+        whenNotPaused
+    {
+        if (tokenType == TokenType.ERC721) revert UAD__UseERC721BatchFunction();
+        _validateToken(token, tokenType);
+
+        uint256 len = entries.length;
+        if (len == 0)           revert UAD__BatchEmpty();
+        if (len > maxBatchSize) revert UAD__BatchTooLarge(len, maxBatchSize);
+
+        uint256 totalAmount;
+
+        for (uint256 i; i < len; ++i) {
+            _validateRecipient(entries[i].recipient);
+            if (entries[i].amount == 0) revert UAD__ZeroAmount();
+            if (tokenType == TokenType.ERC1155 && entries[i].tokenId == 0)
+                revert UAD__ZeroTokenId();
+            totalAmount += entries[i].amount;
         }
 
-        uint256 totalAmount = 0;
-        for (uint256 i = 0; i < length; i++) {
-            require(recipients[i] != address(0), "Zero address");
-            require(amounts[i] > 0, "Zero amount");
-            if (tokenType == TokenType.ERC1155) {
-                require(tokenIds[i] > 0, "Token ID required for ERC1155");
-            }
-            totalAmount += amounts[i];
-        }
-
+        // Pull in bulk for ERC20, per-item for ERC1155
         if (tokenType == TokenType.ERC20) {
-            _checkBalance(tokenAddress, tokenType, totalAmount, 0);
-            _transferFromSenderToContract(tokenAddress, tokenType, totalAmount, 0);
-        } else { // ERC1155
-            for (uint256 i = 0; i < length; i++) {
-                _checkBalance(tokenAddress, tokenType, amounts[i], tokenIds[i]);
-                _transferFromSenderToContract(tokenAddress, tokenType, amounts[i], tokenIds[i]);
+            _checkSenderERC20Balance(token, totalAmount);
+            IERC20(token).safeTransferFrom(msg.sender, address(this), totalAmount);
+        } else {
+            for (uint256 i; i < len; ++i) {
+                _pullFromSender(token, TokenType.ERC1155, entries[i].amount, entries[i].tokenId);
             }
         }
 
-        for (uint256 i = 0; i < length; i++) {
-            uint256 useTokenId = (tokenType == TokenType.ERC20) ? 0 : tokenIds[i];
-            _transferFromContractToRecipient(tokenAddress, tokenType, recipients[i], amounts[i], useTokenId);
-            emit AirdropExecuted(tokenAddress, tokenType, recipients[i], amounts[i], useTokenId);
+        for (uint256 i; i < len; ++i) {
+            uint256 tid = (tokenType == TokenType.ERC20) ? 0 : entries[i].tokenId;
+            _pushToAddress(token, tokenType, entries[i].recipient, entries[i].amount, tid);
+            emit SingleAirdrop(token, tokenType, entries[i].recipient, entries[i].amount, tid);
         }
 
-        emit BatchAirdropExecuted(tokenAddress, tokenType, length, totalAmount);
+        emit BatchAirdrop(token, tokenType, len, totalAmount);
     }
 
+    /*//////////////////////////////////////////////////////////////
+                    CORE: BATCH AIRDROP (ERC721)
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Transfer multiple ERC721 tokens to individual recipients.
+     * @param token       ERC721 contract address.
+     * @param recipients  Array of destination addresses.
+     * @param tokenIds    Array of token IDs (1-to-1 with recipients).
+     */
     function batchAirdropERC721(
-        address tokenAddress,
+        address           token,
         address[] calldata recipients,
         uint256[] calldata tokenIds
-    ) external onlyOwner nonReentrant {
-        require(tokenAddress != address(0), "Invalid token address");
-        uint256 length = recipients.length;
-        require(length == tokenIds.length, "Array length mismatch");
-        require(length > 0 && length <= maxBatchRecipients, "Invalid recipients count");
+    )
+        external
+        onlyOwner
+        nonReentrant
+        whenNotPaused
+    {
+        if (token == address(0)) revert UAD__ZeroAddress();
 
-        for (uint256 i = 0; i < length; i++) {
-            require(recipients[i] != address(0), "Zero address");
-            require(tokenIds[i] > 0, "Zero Token ID");
+        uint256 len = recipients.length;
+        if (len == 0)               revert UAD__BatchEmpty();
+        if (len > maxBatchSize)     revert UAD__BatchTooLarge(len, maxBatchSize);
+        if (len != tokenIds.length) revert UAD__ArrayLengthMismatch();
 
-            _checkBalance(tokenAddress, TokenType.ERC721, 1, tokenIds[i]);
-            _transferFromSenderToContract(tokenAddress, TokenType.ERC721, 1, tokenIds[i]);
-            _transferFromContractToRecipient(tokenAddress, TokenType.ERC721, recipients[i], 1, tokenIds[i]);
+        for (uint256 i; i < len; ++i) {
+            _validateRecipient(recipients[i]);
+            if (tokenIds[i] == 0) revert UAD__ZeroTokenId();
 
-            emit AirdropExecuted(tokenAddress, TokenType.ERC721, recipients[i], 1, tokenIds[i]);
+            if (IERC721(token).ownerOf(tokenIds[i]) != msg.sender)
+                revert UAD__NotTokenOwner(token, tokenIds[i]);
+
+            IERC721(token).safeTransferFrom(msg.sender, recipients[i], tokenIds[i]);
+            emit SingleAirdrop(token, TokenType.ERC721, recipients[i], 1, tokenIds[i]);
         }
 
-        emit ERC721BatchAirdropExecuted(tokenAddress, length, length);
+        emit BatchAirdrop(token, TokenType.ERC721, len, len);
     }
 
+    /*//////////////////////////////////////////////////////////////
+                MERKLE DROP — TRUSTLESS CLAIM LANE
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Register a new Merkle-gated airdrop campaign.
+     *
+     * @dev    Leaf format (double-hashed to prevent second pre-image attacks):
+     * leaf = keccak256(keccak256(abi.encodePacked(claimant, amount, tokenId)))
+     *
+     * Build the tree off-chain with any standard Merkle library
+     * using the same leaf formula.
+     *
+     * @param token       Token to distribute.
+     * @param tokenType   ERC20 | ERC721 | ERC1155.
+     * @param merkleRoot  Root of the off-chain constructed Merkle tree.
+     * @param totalBudget Total tokens locked into this campaign.
+     * @param tokenId     ERC1155 token ID (pass 0 for ERC20).
+     * @return campaignId Newly assigned campaign identifier.
+     */
+    function createMerkleCampaign(
+        address   token,
+        TokenType tokenType,
+        bytes32   merkleRoot,
+        uint256   totalBudget,
+        uint256   tokenId
+    )
+        external
+        onlyOwner
+        nonReentrant
+        whenNotPaused
+        returns (uint256 campaignId)
+    {
+        _validateToken(token, tokenType);
+        if (totalBudget == 0) revert UAD__ZeroAmount();
+
+        _pullFromSender(token, tokenType, totalBudget, tokenId);
+
+        campaignId = nextCampaignId++;
+        campaigns[campaignId] = MerkleCampaign({
+            token:       token,
+            tokenType:   tokenType,
+            root:        merkleRoot,
+            totalBudget: totalBudget,
+            claimed:     0,
+            active:      true
+        });
+
+        emit MerkleCampaignCreated(campaignId, token, tokenType, merkleRoot, totalBudget);
+    }
+
+    /**
+     * @notice Claim tokens from a Merkle campaign.
+     *
+     * @dev    Leaf is double-hashed: keccak256(keccak256(abi.encodePacked(msg.sender, amount, tokenId)))
+     *
+     * @param campaignId  The campaign to claim from.
+     * @param amount      Amount allocated to msg.sender in the tree.
+     * @param tokenId     ERC1155 token ID (pass 0 for ERC20).
+     * @param proof       Merkle proof for this claim.
+     */
+    function claimMerkle(
+        uint256            campaignId,
+        uint256            amount,
+        uint256            tokenId,
+        bytes32[] calldata proof
+    )
+        external
+        nonReentrant
+        whenNotPaused
+    {
+        MerkleCampaign storage campaign = campaigns[campaignId];
+
+        if (!campaign.active)
+            revert UAD__CampaignNotActive();
+
+        if (hasClaimed[campaignId][msg.sender])
+            revert UAD__AlreadyClaimed(campaignId, msg.sender);
+
+        // Double-hash leaf: prevents second pre-image attacks
+        bytes32 leaf = keccak256(
+            bytes.concat(keccak256(abi.encodePacked(msg.sender, amount, tokenId)))
+        );
+
+        if (!MerkleProof.verify(proof, campaign.root, leaf))
+            revert UAD__InvalidMerkleProof();
+
+        hasClaimed[campaignId][msg.sender] = true;
+        campaign.claimed += amount;
+
+        _pushToAddress(campaign.token, campaign.tokenType, msg.sender, amount, tokenId);
+
+        emit MerkleClaimed(campaignId, msg.sender, amount, tokenId);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    EMERGENCY: RECOVERY FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Recover a specific ERC20 or ERC1155 amount from the contract.
+     * For ERC721 use `emergencyWithdrawERC721`.
+     */
     function emergencyWithdraw(
-        address tokenAddress,
+        address   token,
         TokenType tokenType,
-        uint256 amount,
-        uint256 tokenId
-    ) external onlyOwner nonReentrant {
-        require(tokenAddress != address(0), "Invalid token address");
-        require(amount > 0, "Zero amount");
-        if (tokenType == TokenType.ERC721) {
-            require(amount == 1, "ERC721 amount must be 1");
-            require(tokenId > 0, "Token ID required");
-        }
-        _checkContractBalance(tokenAddress, tokenType, amount, tokenId);
-        _transferFromContractToOwner(tokenAddress, tokenType, amount, tokenId);
-        emit EmergencyWithdrawal(owner(), tokenAddress, tokenType, amount, tokenId);
+        uint256   amount,
+        uint256   tokenId
+    )
+        external
+        onlyOwner
+        nonReentrant
+    {
+        if (tokenType == TokenType.ERC721) revert UAD__UseEmergencyWithdrawForERC721();
+        if (token  == address(0)) revert UAD__ZeroAddress();
+        if (amount == 0)          revert UAD__ZeroAmount();
+
+        _checkContractBalance(token, tokenType, amount, tokenId);
+        _pushToAddress(token, tokenType, owner(), amount, tokenId);
+
+        emit EmergencyWithdraw(token, tokenType, owner(), amount, tokenId);
     }
 
+    /**
+     * @notice Recover a specific ERC721 token held by this contract.
+     */
+    function emergencyWithdrawERC721(
+        address token,
+        uint256 tokenId
+    )
+        external
+        onlyOwner
+        nonReentrant
+    {
+        if (token   == address(0)) revert UAD__ZeroAddress();
+        if (tokenId == 0)          revert UAD__ZeroTokenId();
+        if (IERC721(token).ownerOf(tokenId) != address(this))
+            revert UAD__NotTokenOwner(token, tokenId);
+
+        IERC721(token).safeTransferFrom(address(this), owner(), tokenId);
+        emit EmergencyWithdraw(token, TokenType.ERC721, owner(), 1, tokenId);
+    }
+
+    /**
+     * @notice Drain the contract's entire balance of an ERC20 or ERC1155 token.
+     */
     function withdrawAll(
-        address tokenAddress,
+        address   token,
         TokenType tokenType,
-        uint256 tokenId
-    ) external onlyOwner nonReentrant {
-        require(tokenAddress != address(0), "Invalid token address");
-        require(tokenType != TokenType.ERC721, "Use emergencyWithdraw with specific tokenId for ERC721");
-        uint256 balance = contractBalance(tokenAddress, tokenType, tokenId);
-        require(balance > 0, "No tokens to withdraw");
-        _transferFromContractToOwner(tokenAddress, tokenType, balance, tokenId);
-        emit EmergencyWithdrawal(owner(), tokenAddress, tokenType, balance, tokenId);
+        uint256   tokenId
+    )
+        external
+        onlyOwner
+        nonReentrant
+    {
+        if (tokenType == TokenType.ERC721) revert UAD__UseEmergencyWithdrawForERC721();
+        if (token == address(0)) revert UAD__ZeroAddress();
+
+        uint256 bal = contractBalance(token, tokenType, tokenId);
+        if (bal == 0) revert UAD__NothingToWithdraw();
+
+        _pushToAddress(token, tokenType, owner(), bal, tokenId);
+        emit EmergencyWithdraw(token, tokenType, owner(), bal, tokenId);
     }
 
+    /*//////////////////////////////////////////////////////////////
+                            VIEW HELPERS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Returns the contract's current token balance.
+     */
     function contractBalance(
-        address tokenAddress,
+        address   token,
         TokenType tokenType,
-        uint256 tokenId
+        uint256   tokenId
     ) public view returns (uint256) {
-        require(tokenAddress != address(0), "Invalid token address");
+        if (token == address(0)) revert UAD__ZeroAddress();
+        if (tokenType == TokenType.ERC20)
+            return IERC20(token).balanceOf(address(this));
+        if (tokenType == TokenType.ERC721)
+            return IERC721(token).balanceOf(address(this));
+        if (tokenId == 0) revert UAD__ZeroTokenId();
+        return IERC1155(token).balanceOf(address(this), tokenId);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    PRIVATE: TRANSFER HELPERS
+    //////////////////////////////////////////////////////////////*/
+
+    function _pullFromSender(
+        address   token,
+        TokenType tokenType,
+        uint256   amount,
+        uint256   tokenId
+    ) private {
         if (tokenType == TokenType.ERC20) {
-            return IERC20(tokenAddress).balanceOf(address(this));
+            IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
         } else if (tokenType == TokenType.ERC721) {
-            return IERC721(tokenAddress).balanceOf(address(this)); 
+            IERC721(token).safeTransferFrom(msg.sender, address(this), tokenId);
         } else {
-            require(tokenId > 0, "Token ID required for ERC1155 balance");
-            return IERC1155(tokenAddress).balanceOf(address(this), tokenId);
+            IERC1155(token).safeTransferFrom(msg.sender, address(this), tokenId, amount, "");
         }
     }
 
-    // --- Internal Transfer Functions ---
-    function _transferFromSenderToContract(
-        address tokenAddress,
+    function _pushToAddress(
+        address   token,
         TokenType tokenType,
-        uint256 amount,
-        uint256 tokenId
-    ) internal {
+        address   to,
+        uint256   amount,
+        uint256   tokenId
+    ) private {
         if (tokenType == TokenType.ERC20) {
-            IERC20(tokenAddress).safeTransferFrom(msg.sender, address(this), amount);
+            IERC20(token).safeTransfer(to, amount);
         } else if (tokenType == TokenType.ERC721) {
-            IERC721(tokenAddress).safeTransferFrom(msg.sender, address(this), tokenId);
+            IERC721(token).safeTransferFrom(address(this), to, tokenId);
         } else {
-            IERC1155(tokenAddress).safeTransferFrom(msg.sender, address(this), tokenId, amount, "");
+            IERC1155(token).safeTransferFrom(address(this), to, tokenId, amount, "");
         }
     }
 
-    function _transferFromContractToRecipient(
-        address tokenAddress,
-        TokenType tokenType,
-        address recipient,
-        uint256 amount,
-        uint256 tokenId
-    ) internal {
-        if (tokenType == TokenType.ERC20) {
-            IERC20(tokenAddress).safeTransfer(recipient, amount);
-        } else if (tokenType == TokenType.ERC721) {
-            IERC721(tokenAddress).safeTransferFrom(address(this), recipient, tokenId);
-        } else {
-            IERC1155(tokenAddress).safeTransferFrom(address(this), recipient, tokenId, amount, "");
-        }
+    /*//////////////////////////////////////////////////////////////
+                    PRIVATE: VALIDATION HELPERS
+    //////////////////////////////////////////////////////////////*/
+
+    function _validateToken(address token, TokenType tokenType) private pure {
+        if (token == address(0))   revert UAD__ZeroAddress();
+        if (uint8(tokenType) > 2)  revert UAD__InvalidTokenType();
     }
 
-    function _transferFromContractToOwner(
-        address tokenAddress,
-        TokenType tokenType,
-        uint256 amount,
-        uint256 tokenId
-    ) internal {
-        if (tokenType == TokenType.ERC20) {
-            IERC20(tokenAddress).safeTransfer(owner(), amount);
-        } else if (tokenType == TokenType.ERC721) {
-            IERC721(tokenAddress).safeTransferFrom(address(this), owner(), tokenId);
-        } else {
-            IERC1155(tokenAddress).safeTransferFrom(address(this), owner(), tokenId, amount, "");
-        }
+    function _validateRecipient(address recipient) private pure {
+        if (recipient == address(0)) revert UAD__ZeroAddress();
     }
 
-    // --- Internal Balance Checks ---
-    function _checkBalance(
-        address tokenAddress,
-        TokenType tokenType,
-        uint256 amount,
-        uint256 tokenId
-    ) internal view {
-        if (tokenType == TokenType.ERC20) {
-            require(IERC20(tokenAddress).balanceOf(msg.sender) >= amount, "Insufficient ERC20 balance");
-        } else if (tokenType == TokenType.ERC721) {
-            require(IERC721(tokenAddress).ownerOf(tokenId) == msg.sender, "Sender does not own NFT ID");
-        } else {
-            require(IERC1155(tokenAddress).balanceOf(msg.sender, tokenId) >= amount, "Insufficient ERC1155 tokens");
-        }
+    function _checkSenderERC20Balance(address token, uint256 amount) private view {
+        uint256 bal = IERC20(token).balanceOf(msg.sender);
+        if (bal < amount) revert UAD__InsufficientBalance(token, amount, bal);
     }
 
     function _checkContractBalance(
-        address tokenAddress,
+        address   token,
         TokenType tokenType,
-        uint256 amount,
-        uint256 tokenId
-    ) internal view {
+        uint256   amount,
+        uint256   tokenId
+    ) private view {
         if (tokenType == TokenType.ERC20) {
-            require(IERC20(tokenAddress).balanceOf(address(this)) >= amount, "Insufficient contract ERC20 balance");
+            uint256 bal = IERC20(token).balanceOf(address(this));
+            if (bal < amount) revert UAD__InsufficientBalance(token, amount, bal);
         } else if (tokenType == TokenType.ERC721) {
-            require(IERC721(tokenAddress).ownerOf(tokenId) == address(this), "Contract does not own NFT ID");
+            if (IERC721(token).ownerOf(tokenId) != address(this))
+                revert UAD__NotTokenOwner(token, tokenId);
         } else {
-            require(IERC1155(tokenAddress).balanceOf(address(this), tokenId) >= amount, "Insufficient contract ERC1155 tokens");
+            uint256 bal = IERC1155(token).balanceOf(address(this), tokenId);
+            if (bal < amount) revert UAD__InsufficientBalance(token, amount, bal);
         }
     }
 }

@@ -2,83 +2,80 @@
 pragma solidity ^0.8.24;
 
 import "forge-std/Script.sol";
-import "forge-std/console.sol";
 import "../src/DeFiHub.sol";
-import "../src/mocks/MockERC20.sol";
+import "../src/mocks/MockERC20.sol"; 
 
-/// @title DeployDeFiHub Script - FlashVerse Global Deployment (Flexible)
-/// @notice Deploys DeFiHub with either existing tokens or mocks for local testing.
+/**
+ * @title DeployDeFiHub
+ * @dev Fixed deployment script. Passes the required arguments (Name, Symbol, Supply) 
+ * to the MockERC20 constructor to resolve the 'Wrong argument count' error.
+ */
 contract DeployDeFiHub is Script {
+
     function run() external {
-        // Load deployer's private key securely
-        uint256 deployerPrivateKey;
-        try vm.envUint("PRIVATE_KEY") returns (uint256 key) {
-            deployerPrivateKey = key;
-        } catch {
-            revert("PRIVATE_KEY environment variable not set or invalid");
-        }
-        require(deployerPrivateKey != 0, "Invalid PRIVATE_KEY (must be non-zero)");
+        // 1. Setup Deployer Environment
+        uint256 deployerKey = vm.envUint("PRIVATE_KEY");
+        address deployer    = vm.addr(deployerKey);
 
-        vm.startBroadcast(deployerPrivateKey);
+        vm.startBroadcast(deployerKey);
 
-        address stakingToken;
-        address rewardToken;
+        // 2. Deploy MockERC20 Instances
+        // Constructor arguments: (string memory name, string memory symbol, uint256 initialSupply)
+        // Adjust these if your MockERC20.sol uses a different order or different types.
+        
+        console.log("Step 1: Deploying MockERC20 instances with constructor arguments...");
 
-        // Try to load STAKING_TOKEN from environment, fallback to MockERC20
-        try vm.envAddress("STAKING_TOKEN") returns (address addr) {
-            stakingToken = addr;
-        } catch {
-            console.log("STAKING_TOKEN not set or invalid, deploying MockERC20...");
-            MockERC20 mockStaking = new MockERC20("Mock Staking Token", "MST", 18);
-            stakingToken = address(mockStaking);
-            console.log("Mock StakingToken deployed at:");
-            console.logAddress(stakingToken);
-        }
-        require(stakingToken != address(0), "Staking Token address is zero");
+        MockERC20 stakingToken = new MockERC20(
+            "Staking Token", 
+            "STK", 
+            1_000_000 * 10**18
+        );
 
-        // Try to load REWARD_TOKEN from environment, fallback to MockERC20
-        try vm.envAddress("REWARD_TOKEN") returns (address addr) {
-            rewardToken = addr;
-        } catch {
-            console.log("REWARD_TOKEN not set or invalid, deploying MockERC20...");
-            MockERC20 mockReward = new MockERC20("Mock Reward Token", "MRT", 18);
-            rewardToken = address(mockReward);
-            console.log("Mock RewardToken deployed at:");
-            console.logAddress(rewardToken);
-        }
-        require(rewardToken != address(0), "Reward Token address is zero");
+        MockERC20 rewardToken = new MockERC20(
+            "Reward Token", 
+            "REW", 
+            1_000_000 * 10**18
+        );
+        
+        console.log("Staking Token (Asset A) deployed at:", address(stakingToken));
+        console.log("Reward Token (Asset B) deployed at:", address(rewardToken));
 
-        // Load reward rate, fallback to default 1e18
-        uint256 rewardRate;
-        try vm.envUint("REWARD_RATE") returns (uint256 rate) {
-            rewardRate = rate;
-        } catch {
-            rewardRate = 1e18;
-            console.log("REWARD_RATE not set or invalid, using default 1e18");
-        }
-        require(rewardRate > 0, "Reward rate must be greater than zero.");
+        // 3. Deploy DeFiHub Core
+        console.log("Step 2: Deploying DeFiHub v3...");
+        
+        address treasury = address(0x3333333333333333333333333333333333333333);
+        uint256 rewardRate = 1e18; 
 
-        console.log("--- Deployment Parameters ---");
-        console.log("Staking Token:", stakingToken);
-        console.log("Reward Token:", rewardToken);
-        console.log("Reward Rate:", rewardRate);
-        console.log("-----------------------------");
+        DeFiHub hub = new DeFiHub(
+            address(stakingToken),
+            address(rewardToken),
+            rewardRate,
+            treasury
+        );
 
-        // Deploy DeFiHub with robust error handling
-        DeFiHub hub;
-        try new DeFiHub(stakingToken, rewardToken, rewardRate) returns (DeFiHub _hub) {
-            hub = _hub;
-            console.log("DeFiHub deployed successfully at:");
-            console.logAddress(address(hub));
-        } catch Error(string memory reason) {
-            console.log("Deployment failed with reason:");
-            console.log(reason);
-            revert("DeFiHub deployment reverted");
-        } catch {
-            console.log("Unknown error during DeFiHub deployment");
-            revert("Unknown failure");
-        }
+        console.log("DeFiHub successfully deployed at:", address(hub));
 
         vm.stopBroadcast();
+
+        _printSummary(address(hub), address(stakingToken), address(rewardToken));
+    }
+
+    // --- LOGGING HELPERS ---
+
+    function _printHeader(address deployer) internal view {
+        console.log("------------------------------------------------");
+        console.log("FlashVerse: Sequential Deployment Fix");
+        console.log("Deployer Address:", deployer);
+        console.log("------------------------------------------------");
+    }
+
+    function _printSummary(address hub, address staking, address reward) internal pure {
+        console.log("------------------------------------------------");
+        console.log("DEPLOYMENT SUMMARY");
+        console.log("------------------------------------------------");
+        console.log("DeFiHub Contract: ", hub);
+        console.log("Staking Asset:    ", staking);
+        console.log("Reward Asset:     ", reward);
+        console.log("------------------------------------------------");
     }
 }

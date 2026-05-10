@@ -52,7 +52,8 @@ contract FlashIDRegistry is Ownable {
         if (_idHashOf[msg.sender] == bytes32(0)) revert NotRegistered(msg.sender);
     }
     
-    modifier onlyRegistered() {
+    // CORRECTION APPLIED HERE
+    modifier onlyRegistered() { 
         _onlyRegistered();
         _;
     }
@@ -214,7 +215,7 @@ contract FlashIDRegistry is Ownable {
         bytes32 h = _hashId(normalizedId);
         if (_ownerOfHash[h] != address(0)) revert IDTaken(normalizedId);
         
-        // Corrected check: bytes32 against bytes32(0)
+        // Check if the target address 'to' already has an ID
         if (_idHashOf[to] != bytes32(0)) revert AlreadyRegistered(to);
 
         _idHashOf[to] = h;

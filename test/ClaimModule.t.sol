@@ -1,436 +1,965 @@
-// test/ClaimModule.t.sol
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
-import "../src/ClaimModule.sol";
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "forge-std/console.sol";
 
-/// @dev Simple ERC20 mock for tests
-contract MockERC20 is ERC20 {
-    constructor(string memory name_, string memory symbol_) ERC20(name_, symbol_) {}
+import {ClaimModule} from "../src/ClaimModule.sol";
+import {ERC20Mock}   from "@openzeppelin/contracts/mocks/token/ERC20Mock.sol";
 
-    function mint(address to, uint256 amount) external {
-        _mint(to, amount);
-    }
-}
-
+/**
+ * @title  ClaimModuleTest
+ * @notice Full Foundry test suite for ClaimModule.
+ *
+ * @dev    Merkle tree is built manually inside Solidity using the same
+ * double-hash leaf formula used in ClaimModule._buildLeaf():
+ *
+ * leaf = keccak256(abi.encode(keccak256(abi.encodePacked(
+ * account, allocation, nonce, category
+ * ))))
+ *
+ * For single-leaf trees the root == leaf, so no sibling is needed
+ * and the proof is an empty array — which is what MerkleProof.verify
+ * accepts correctly for single-entry trees.
+ *
+ * For two-leaf trees we sort the pair (lower hash first) and pass the
+ * sibling as a one-element proof.
+ */
 contract ClaimModuleTest is Test {
-    ClaimModule claim;
-    MockERC20 token;
-    address admin;
-    address alice;
-    address bob;
-    address carol;
-    uint256 constant A_ID_1 = 1;
-    uint256 constant A_ID_2 = 2;
 
-    // helper for leaf data shape: abi.encodePacked(account, allocation, nonce, category)
-    function mkLeaf(address account, uint256 allocation, uint256 nonce, uint256 category) internal pure returns (bytes32) {
-        return keccak256(abi.encodePacked(account, allocation, nonce, category));
-    }
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Accounts
+    // ═══════════════════════════════════════════════════════════════════════
 
-    /// simple helper to build merkle root from list of leaves (pairwise concatenation, NOW WITH SORTING)
-    function buildMerkleRoot(bytes32[] memory leaves) internal pure returns (bytes32) {
-        require(leaves.length > 0, "no leaves");
-        // if single leaf -> root is leaf
-        if (leaves.length == 1) return leaves[0];
+    address internal admin    = makeAddr("admin");
+    address internal pauser   = makeAddr("pauser");
+    address internal monitor  = makeAddr("monitor");
+    address internal alice    = makeAddr("alice");
+    address internal bob      = makeAddr("bob");
+    address internal carol    = makeAddr("carol");
+    address internal attacker = makeAddr("attacker");
 
-        // iterative level-up
-        while (leaves.length > 1) {
-            uint256 nextLen = (leaves.length + 1) / 2;
-            bytes32[] memory next = new bytes32[](nextLen);
-            uint256 j = 0;
-            for (uint256 i = 0; i < leaves.length; i += 2) {
-                if (i + 1 < leaves.length) {
-                    bytes32 a = leaves[i];
-                    bytes32 b = leaves[i + 1];
-                    
-                    // Enforce canonical ordering (a < b)
-                    if (a > b) {
-                        (a, b) = (b, a);
-                    }
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Contracts
+    // ═══════════════════════════════════════════════════════════════════════
 
-                    next[j++] = keccak256(abi.encodePacked(a, b)); 
-                } else {
-                    // odd node => carry forward
-                    next[j++] = leaves[i];
-                }
-            }
-            leaves = next;
-        }
-        return leaves[0];
-    }
+    ClaimModule internal cm;
+    ERC20Mock   internal token;
 
-    /// Build Merkle proof for small tree (NOW WITH SORTING ASSUMPTION)
-    function buildProofForIndex(bytes32[] memory leaves, uint256 index) internal pure returns (bytes32[] memory) {
-        require(index < leaves.length, "index out");
-        bytes32[] memory proof = new bytes32[](0); // Initialize empty proof
-        if (leaves.length == 1) {
-            return proof; // Empty proof for single leaf
-        }
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Shared constants
+    // ═══════════════════════════════════════════════════════════════════════
 
-        // Build all levels and keep siblings
-        bytes32[] memory layer = leaves;
+    uint256 internal constant ALLOCATION = 1_000 ether;
+    uint256 internal constant CATEGORY   = 1;
+    uint256 internal constant AIRDROP_ID = 1;
 
-        while (layer.length > 1) {
-            uint256 siblingIndex;
-            if (index % 2 == 0) { // Current node is on the left
-                siblingIndex = index + 1;
-            } else { // Current node is on the right
-                siblingIndex = index - 1;
-            }
-            
-            // Check if sibling exists
-            if (siblingIndex < layer.length) {
-                // The sibling hash is the proof part for this level
-                bytes32 sibling = layer[siblingIndex];
-                
-                // append to proof
-                bytes32[] memory tmp = new bytes32[](proof.length + 1);
-                for (uint256 k = 0; k < proof.length; k++) tmp[k] = proof[k];
-                tmp[proof.length] = sibling; // Add the sibling to the proof array
-                proof = tmp;
-            }
-            
-            // build next layer (with sorting for hashing)
-            uint256 nextLen = (layer.length + 1) / 2;
-            bytes32[] memory next = new bytes32[](nextLen);
-            uint256 j = 0;
-            for (uint256 i = 0; i < layer.length; i += 2) {
-                if (i + 1 < layer.length) {
-                    bytes32 a = layer[i];
-                    bytes32 b = layer[i + 1];
-                    
-                    // Enforce canonical ordering (a < b)
-                    if (a > b) {
-                        (a, b) = (b, a);
-                    }
-                    next[j++] = keccak256(abi.encodePacked(a, b));
-                } else {
-                    next[j++] = layer[i];
-                }
-            }
-            index = index / 2;
-            layer = next;
-        }
-        return proof;
-    }
+    uint256 internal constant DURATION   = 1_000; // seconds
+    uint256 internal constant CLIFF      = 200;   // seconds
 
-    // Helper to get next nonce for a user in an airdrop
-    function getNextNonce(address user, uint256 id) internal view returns (uint256) {
-        return claim.getNonce(id, user);
-    }
+    bytes32 internal ADMIN_ROLE;
+    bytes32 internal PAUSER_ROLE;
+    bytes32 internal MONITOR_ROLE;
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Setup
+    // ═══════════════════════════════════════════════════════════════════════
 
     function setUp() public {
-        admin = vm.addr(0xDEAD);
-        alice = vm.addr(0xA11CE);
-        bob = vm.addr(0xB0B);
-        carol = vm.addr(0xC0FFEE);
-
-        // deploy
-        claim = new ClaimModule();
-        token = new MockERC20("Mock", "MCK");
-
-        // fund token and grant roles
-        token.mint(address(this), 1_000_000 ether);
+        // Deploy mock ERC-20
+        token = new ERC20Mock();
         token.mint(admin, 1_000_000 ether);
 
-        // grant admin role to admin (deployer has roles initially)
-        vm.startPrank(address(this)); // Prank as deployer
-        claim.grantRole(claim.ADMIN_ROLE(), admin);
-        claim.grantRole(claim.PAUSER_ROLE(), admin);
-        claim.grantRole(claim.MONITOR_ROLE(), admin);
+        // Deploy ClaimModule
+        vm.prank(admin);
+        cm = new ClaimModule(admin);
+
+        // Fund contract
+        vm.prank(admin);
+        token.transfer(address(cm), 500_000 ether);
+        vm.deal(address(cm), 100 ether);
+
+        // Grant secondary roles
+        vm.startPrank(admin);
+        cm.grantRole(cm.PAUSER_ROLE(),  pauser);
+        cm.grantRole(cm.MONITOR_ROLE(), monitor);
         vm.stopPrank();
 
-        // send some tokens/ETH to contract for claims
-        vm.prank(admin);
-        token.transfer(address(claim), 10000 ether);
-
-        // send some ETH to contract
-        vm.deal(address(claim), 20 ether); // Increased deal amount for robustness
+        // Cache roles
+        ADMIN_ROLE   = cm.ADMIN_ROLE();
+        PAUSER_ROLE  = cm.PAUSER_ROLE();
+        MONITOR_ROLE = cm.MONITOR_ROLE();
     }
 
-    /// -------------------------------
-    /// Basic: create airdrop and single ERC20 claim
-    /// -------------------------------
-    function testCreateAirdropAndClaimERC20() public {
-        // prepare leaves: alice (100), bob (50) nonce=0 category=0
-        bytes32[] memory leaves = new bytes32[](2);
-        leaves[0] = mkLeaf(alice, 100 ether, 0, 0);
-        leaves[1] = mkLeaf(bob, 50 ether, 0, 0);
-        
-        // Root is built using the canonical sorted hashing (a < b)
-        bytes32 root = buildMerkleRoot(leaves); 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Internal helpers
+    // ═══════════════════════════════════════════════════════════════════════
 
-        // create airdrop (start slightly in future to test start validation)
-        uint256 start = block.timestamp + 1;
-        vm.prank(admin);
-        claim.createAirdrop(A_ID_1, address(token), root, 150 ether, start, 0, 100);
-
-        // before start -> getClaimableAmount returns 0 regardless
-        bytes32[] memory proofAlice = buildProofForIndex(leaves, 0); 
-        uint256 claimableBefore = claim.getClaimableAmount(A_ID_1, alice, 100 ether, 0, 0, proofAlice);
-        assertEq(claimableBefore, 0);
-
-        // fast-forward to start + half duration -> vested = allocation * elapsed/duration
-        vm.warp(start + 50);
-        uint256 claimable = claim.getClaimableAmount(A_ID_1, alice, 100 ether, 0, 0, proofAlice);
-        // vested should be approx 50% of 100 ether = 50 ether
-        assertEq(claimable, 50 ether);
-
-        // perform claim
-        vm.prank(alice);
-        claim.claim(A_ID_1, 100 ether, 0, 0, proofAlice); 
-
-        // alice should receive claimable tokens
-        assertEq(token.balanceOf(alice), 50 ether);
-        // claimed recorded
-        assertEq(claim.claimed(A_ID_1, alice), 50 ether);
-
-        // subsequent claim before more vesting -> revert NothingToClaim (Actual error is InvalidParameters)
-        vm.prank(alice);
-        // 🌟 CORRECTION: Adjusting expected error to match contract's actual revert for this state.
-        vm.expectRevert(InvalidParameters.selector); 
-        claim.claim(A_ID_1, 100 ether, 0, 0, proofAlice);
+    /// @dev Mirror of ClaimModule._buildLeaf()
+    function _leaf(
+        address account,
+        uint256 allocation,
+        uint256 nonce,
+        uint256 category
+    ) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                keccak256(abi.encodePacked(account, allocation, nonce, category))
+            )
+        );
     }
 
-    /// -------------------------------
-    /// ETH claim test
-    /// -------------------------------
-    function testClaimETH() public {
-        // build root for single allocation to carol
-        bytes32[] memory leaves = new bytes32[](1);
-        leaves[0] = mkLeaf(carol, 1 ether, 0, 0);
-        bytes32 root = buildMerkleRoot(leaves);
-
-        // create ETH airdrop
-        uint256 start = block.timestamp + 1;
-        vm.prank(admin);
-        claim.createAirdrop(A_ID_2, address(0), root, 1 ether, start, 0, 1);
-
-        // contract already has 20 ETH from setUp
-        vm.warp(start + 1);
-        bytes32[] memory proof = buildProofForIndex(leaves, 0);
-
-        uint256 balBefore = carol.balance;
-        vm.prank(carol);
-        claim.claim(A_ID_2, 1 ether, 0, 0, proof);
-        assertEq(carol.balance - balBefore, 1 ether);
+    /// @dev For a single-leaf tree: root == leaf, proof == [].
+    function _singleLeafRoot(bytes32 leaf) internal pure returns (bytes32) {
+        return leaf;
     }
 
-    /// -------------------------------
-    /// Batch claim (aggregation) and MAX_BATCH_SIZE guard
-    /// -------------------------------
-    function testBatchClaimAggregatesSameToken() public {
-        // Create two airdrops for the same token; both allocate to alice
-        bytes32[] memory leaves1 = new bytes32[](1);
-        leaves1[0] = mkLeaf(alice, 10 ether, 0, 0);
-        bytes32 root1 = buildMerkleRoot(leaves1);
-
-        bytes32[] memory leaves2 = new bytes32[](1);
-        leaves2[0] = mkLeaf(alice, 20 ether, 0, 0);
-        bytes32 root2 = buildMerkleRoot(leaves2);
-
-        vm.prank(admin);
-        claim.createAirdrop(10, address(token), root1, 10 ether, block.timestamp, 0, 1);
-
-        vm.prank(admin);
-        claim.createAirdrop(11, address(token), root2, 20 ether, block.timestamp, 0, 1);
-
-        // warp to after vesting
-        vm.warp(block.timestamp + 2);
-
-        // build proofs
-        bytes32[] memory proof1 = buildProofForIndex(leaves1, 0);
-        bytes32[] memory proof2 = buildProofForIndex(leaves2, 0);
-
-        // batch claim
-        uint256[] memory ids = new uint256[](2);
-        ids[0] = 10;
-        ids[1] = 11;
-
-        address[] memory tokens = new address[](2);
-        tokens[0] = address(token);
-        tokens[1] = address(token);
-
-        uint256[] memory allocations = new uint256[](2);
-        allocations[0] = 10 ether;
-        allocations[1] = 20 ether;
-
-        uint256[] memory noncesArr = new uint256[](2);
-        noncesArr[0] = 0;
-        noncesArr[1] = 0;
-
-        uint256[] memory categories = new uint256[](2);
-        categories[0] = 0;
-        categories[1] = 0;
-
-        bytes32[][] memory proofs = new bytes32[][](2);
-        proofs[0] = proof1;
-        proofs[1] = proof2;
-
-        vm.prank(alice);
-        claim.batchClaim(ids, tokens, allocations, noncesArr, categories, proofs);
-
-        // alice should have 30 tokens now
-        assertEq(token.balanceOf(alice), 30 ether);
+    /// @dev For a two-leaf tree: sort leaves, root = keccak256(abi.encodePacked(lo, hi)).
+    function _twoLeafRoot(bytes32 a, bytes32 b) internal pure returns (bytes32 root, bytes32 sibling) {
+        (bytes32 lo, bytes32 hi) = a < b ? (a, b) : (b, a);
+        root    = keccak256(abi.encodePacked(lo, hi));
+        // sibling of `a` is `b`, and vice-versa
+        sibling = (a == lo) ? hi : lo;
     }
 
-    function testBatchClaimTooLargeReverts() public {
-        // create arrays larger than MAX_BATCH_SIZE
-        uint256 max = claim.MAX_BATCH_SIZE();
-        uint256 len = max + 1;
-        uint256[] memory ids = new uint256[](len);
-        address[] memory tokens = new address[](len);
-        uint256[] memory allocations = new uint256[](len);
-        uint256[] memory noncesArr = new uint256[](len);
-        uint256[] memory categories = new uint256[](len);
-        bytes32[][] memory proofs = new bytes32[][](len);
+    /// @dev Create a single-leaf instant airdrop for `account` with `allocation`.
+    function _createInstantAirdrop(
+        uint256 id,
+        address account,
+        uint256 allocation,
+        uint256 nonce,
+        uint256 category
+    ) internal returns (bytes32 root, bytes32[] memory proof) {
+        bytes32 leaf = _leaf(account, allocation, nonce, category);
+        root  = _singleLeafRoot(leaf);
+        proof = new bytes32[](0);
 
-        vm.prank(alice);
-        vm.expectRevert(InvalidParameters.selector);
-        claim.batchClaim(ids, tokens, allocations, noncesArr, categories, proofs);
+        uint256 start = block.timestamp + 5;
+        vm.prank(admin);
+        cm.createAirdrop(id, address(token), root, allocation, start, 0, 0);
+        vm.warp(block.timestamp + 10); // past start
     }
 
-    function testBatchClaimDuplicateIdsReverts() public {
-        // Create airdrop
-        bytes32[] memory leaves = new bytes32[](1);
-        leaves[0] = mkLeaf(alice, 10 ether, 0, 0);
-        bytes32 root = buildMerkleRoot(leaves);
+    /// @dev Create a single-leaf ETH instant airdrop.
+    function _createEthAirdrop(
+        uint256 id,
+        address account,
+        uint256 allocation
+    ) internal returns (bytes32[] memory proof) {
+        bytes32 leaf = _leaf(account, allocation, 0, CATEGORY);
+        bytes32 root = _singleLeafRoot(leaf);
+        proof = new bytes32[](0);
 
+        uint256 start = block.timestamp + 5;
         vm.prank(admin);
-        claim.createAirdrop(20, address(token), root, 10 ether, block.timestamp, 0, 1);
-
-        // warp to after vesting
-        vm.warp(block.timestamp + 2);
-
-        // build proof
-        bytes32[] memory proof = buildProofForIndex(leaves, 0);
-
-        // batch claim with duplicate IDs
-        uint256[] memory ids = new uint256[](2);
-        ids[0] = 20;
-        ids[1] = 20; // duplicate
-
-        address[] memory tokens = new address[](2);
-        tokens[0] = address(token);
-        tokens[1] = address(token);
-
-        uint256[] memory allocations = new uint256[](2);
-        allocations[0] = 10 ether;
-        allocations[1] = 10 ether;
-
-        uint256[] memory noncesArr = new uint256[](2);
-        noncesArr[0] = 0;
-        noncesArr[1] = 0;
-
-        uint256[] memory categories = new uint256[](2);
-        categories[0] = 0;
-        categories[1] = 0;
-
-        bytes32[][] memory proofs = new bytes32[][](2);
-        proofs[0] = proof;
-        proofs[1] = proof;
-
-        vm.prank(alice);
-        vm.expectRevert(InvalidParameters.selector);
-        claim.batchClaim(ids, tokens, allocations, noncesArr, categories, proofs);
+        cm.createAirdrop(id, address(0), root, allocation, start, 0, 0);
+        vm.warp(block.timestamp + 10);
     }
 
-    /// -------------------------------
-    /// Invalid proof and paused behavior
-    /// -------------------------------
-    function testInvalidProofReverts() public {
-        // create simple airdrop for bob
-        bytes32[] memory leaves = new bytes32[](1);
-        leaves[0] = mkLeaf(bob, 5 ether, 0, 0);
-        bytes32 root = buildMerkleRoot(leaves);
+    // ═══════════════════════════════════════════════════════════════════════
+    //  1. DEPLOYMENT
+    // ═══════════════════════════════════════════════════════════════════════
 
-        vm.prank(admin);
-        claim.createAirdrop(20, address(token), root, 5 ether, block.timestamp, 0, 1);
-
-        // use wrong proof (empty)
-        bytes32[] memory empty = new bytes32[](0);
-        vm.prank(bob);
-        vm.expectRevert(InvalidParameters.selector); 
-        claim.claim(20, 5 ether, 0, 0, empty);
+    function test_deployment_rolesGrantedToAdmin() public view {
+        assertTrue(cm.hasRole(cm.DEFAULT_ADMIN_ROLE(), admin));
+        assertTrue(cm.hasRole(ADMIN_ROLE,   admin));
+        assertTrue(cm.hasRole(PAUSER_ROLE,  admin));
+        assertTrue(cm.hasRole(MONITOR_ROLE, admin));
     }
 
-    function testGlobalPauseBlocksClaims() public {
-        // create airdrop for alice
-        bytes32[] memory leaves = new bytes32[](1);
-        leaves[0] = mkLeaf(alice, 1 ether, 0, 0);
-        bytes32 root = buildMerkleRoot(leaves);
-
-        vm.prank(admin);
-        claim.createAirdrop(30, address(token), root, 1 ether, block.timestamp, 0, 1);
-
-        // pause globally
-        vm.prank(admin);
-        claim.setGlobalPause(true);
-
-        bytes32[] memory proof = buildProofForIndex(leaves, 0);
-        vm.prank(alice);
-        vm.expectRevert(IsGlobalPaused.selector);
-        claim.claim(30, 1 ether, 0, 0, proof);
-
-        // unpause and succeed
-        vm.prank(admin);
-        claim.setGlobalPause(false);
-        vm.warp(block.timestamp + 2); // Ensure vested
-        vm.prank(alice);
-        claim.claim(30, 1 ether, 0, 0, proof);
-        assertEq(claim.claimed(30, alice), 1 ether);
+    function test_deployment_notPaused() public view {
+        assertFalse(cm.globalPaused());
     }
 
-    /// -------------------------------
-    /// Overflow prevention in vestedAmount
-    /// -------------------------------
-    function testVestedAmountOverflow() public {
-        // Create airdrop with large allocation
-        bytes32[] memory leaves = new bytes32[](1);
-        leaves[0] = mkLeaf(alice, type(uint256).max, 0, 0); // Max uint256 allocation
-        bytes32 root = buildMerkleRoot(leaves);
-
-        vm.prank(admin);
-        claim.createAirdrop(40, address(token), root, type(uint256).max, block.timestamp, 0, 1);
-
-        // warp to after vesting
-        vm.warp(block.timestamp + 2);
-
-        // Try to claim with large allocation that would cause overflow in vestedAmount
-        bytes32[] memory proof = buildProofForIndex(leaves, 0);
-        vm.prank(alice);
-        // Expect a revert, likely due to token transfer failure (InsufficientBalance)
-        vm.expectRevert(); 
-        claim.claim(40, type(uint256).max, 0, 0, proof);
+    function test_deployment_revertsOnZeroAdmin() public {
+        vm.expectRevert(ClaimModule.ZeroAddress.selector);
+        new ClaimModule(address(0));
     }
 
-    /// -------------------------------
-    /// Emergency withdraw by admin only
-    /// -------------------------------
-    function testEmergencyWithdrawAccessControl() public {
-        // non-admin cannot call
-        vm.prank(alice);
+    function test_deployment_maxBatchSize() public view {
+        assertEq(cm.MAX_BATCH_SIZE(), 50);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  2. CREATE AIRDROP — success paths
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_createAirdrop_storesCorrectData() public {
+        bytes32 leaf = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root = _singleLeafRoot(leaf);
+        uint256 start = block.timestamp + 60;
+
+        vm.prank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, start, CLIFF, DURATION);
+
+        (
+            bytes32 storedRoot,
+            address storedToken,
+            uint256 storedAlloc,
+            ,
+            uint256 storedStart,
+            uint256 storedCliff,
+            uint256 storedDuration,
+            bool    storedActive
+        ) = cm.airdrops(AIRDROP_ID);
+
+        assertEq(storedRoot,     root);
+        assertEq(storedToken,    address(token));
+        assertEq(storedAlloc,    ALLOCATION);
+        assertEq(storedStart,    start);
+        assertEq(storedCliff,    CLIFF);
+        assertEq(storedDuration, DURATION);
+        assertTrue(storedActive);
+        assertTrue(cm.exists(AIRDROP_ID));
+        assertTrue(cm.usedRoots(root));
+    }
+
+    function test_createAirdrop_emitsEvent() public {
+        bytes32 leaf  = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root  = _singleLeafRoot(leaf);
+        uint256 start = block.timestamp + 60;
+
+        vm.expectEmit(true, true, false, true);
+        emit ClaimModule.AirdropCreated(
+            AIRDROP_ID, address(token), root, ALLOCATION, start, CLIFF, DURATION
+        );
+
+        vm.prank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, start, CLIFF, DURATION);
+    }
+
+    function test_createAirdrop_ethToken() public {
+        bytes32 leaf  = _leaf(alice, 1 ether, 0, CATEGORY);
+        bytes32 root  = _singleLeafRoot(leaf);
+        uint256 start = block.timestamp + 60;
+
+        vm.prank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(0), root, 1 ether, start, 0, 0);
+
+        (,address storedToken,,,,,, ) = cm.airdrops(AIRDROP_ID);
+        assertEq(storedToken, address(0));
+    }
+
+    function test_createAirdrop_instantNoVesting() public {
+        bytes32 leaf  = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root  = _singleLeafRoot(leaf);
+        uint256 start = block.timestamp + 60;
+
+        vm.prank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, start, 0, 0);
+
+        (,,,,,, uint256 storedDuration, ) = cm.airdrops(AIRDROP_ID);
+        assertEq(storedDuration, 0);
+    }
+
+    function test_createAirdrop_appendsToIdList() public {
+        bytes32 leaf  = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root  = _singleLeafRoot(leaf);
+        uint256 start = block.timestamp + 60;
+
+        vm.prank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, start, 0, 0);
+
+        uint256[] memory ids = cm.getAirdropIds();
+        assertEq(ids.length, 1);
+        assertEq(ids[0], AIRDROP_ID);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  3. CREATE AIRDROP — revert paths
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_createAirdrop_revertsOnDuplicateId() public {
+        bytes32 leaf  = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root  = _singleLeafRoot(leaf);
+        uint256 start = block.timestamp + 60;
+
+        vm.startPrank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, start, 0, 0);
+
+        bytes32 leaf2 = _leaf(bob, ALLOCATION, 0, CATEGORY);
+        bytes32 root2 = _singleLeafRoot(leaf2);
+
+        vm.expectRevert(ClaimModule.InvalidParameters.selector);
+        cm.createAirdrop(AIRDROP_ID, address(token), root2, ALLOCATION, start, 0, 0);
+        vm.stopPrank();
+    }
+
+    function test_createAirdrop_revertsOnDuplicateMerkleRoot() public {
+        bytes32 leaf = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root = _singleLeafRoot(leaf);
+        uint256 start = block.timestamp + 60;
+
+        vm.startPrank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, start, 0, 0);
+
+        vm.expectRevert(ClaimModule.RootAlreadyUsed.selector);
+        cm.createAirdrop(2, address(token), root, ALLOCATION, start, 0, 0);
+        vm.stopPrank();
+    }
+
+    function test_createAirdrop_revertsOnZeroId() public {
+        bytes32 leaf = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root = _singleLeafRoot(leaf);
+
+        vm.expectRevert(ClaimModule.InvalidParameters.selector);
+        vm.prank(admin);
+        cm.createAirdrop(0, address(token), root, ALLOCATION, block.timestamp + 60, 0, 0);
+    }
+
+    function test_createAirdrop_revertsOnPastStart() public {
+        bytes32 leaf = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root = _singleLeafRoot(leaf);
+
+        vm.expectRevert(ClaimModule.InvalidStartTime.selector);
+        vm.prank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, block.timestamp - 1, 0, 0);
+    }
+
+    function test_createAirdrop_revertsCliffGtDuration() public {
+        bytes32 leaf = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root = _singleLeafRoot(leaf);
+
+        vm.expectRevert(ClaimModule.InvalidParameters.selector);
+        vm.prank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, block.timestamp + 60, 200, 100);
+    }
+
+    function test_createAirdrop_revertsCliffWithZeroDuration() public {
+        bytes32 leaf = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root = _singleLeafRoot(leaf);
+
+        vm.expectRevert(ClaimModule.InvalidParameters.selector);
+        vm.prank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, block.timestamp + 60, 10, 0);
+    }
+
+    function test_createAirdrop_revertsFromNonAdmin() public {
+        bytes32 leaf = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root = _singleLeafRoot(leaf);
+
         vm.expectRevert();
-        claim.emergencyWithdraw(address(token), alice, 1 ether);
+        vm.prank(attacker);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, block.timestamp + 60, 0, 0);
+    }
 
-        // admin can withdraw token
-        uint256 adminTokenBalanceBefore = token.balanceOf(admin);
+    // ═══════════════════════════════════════════════════════════════════════
+    //  4. TOGGLE & GLOBAL PAUSE
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_toggleAirdrop_setsActiveAndEmits() public {
+        _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        vm.expectEmit(true, false, false, true);
+        emit ClaimModule.AirdropToggled(AIRDROP_ID, false);
+
         vm.prank(admin);
-        claim.emergencyWithdraw(address(token), admin, 1 ether);
-        assertEq(token.balanceOf(admin), adminTokenBalanceBefore + 1 ether, "Token withdrawal failed");
+        cm.toggleAirdrop(AIRDROP_ID, false);
 
-        // ETH withdraw test
-        uint256 contractBalanceBefore = address(claim).balance; 
-        uint256 amountToWithdraw = 1 ether;
+        (,,,,,,, bool active) = cm.airdrops(AIRDROP_ID);
+        assertFalse(active);
+    }
+
+    function test_toggleAirdrop_revertsOnNonExistentId() public {
+        vm.expectRevert(ClaimModule.InvalidAirdrop.selector);
+        vm.prank(admin);
+        cm.toggleAirdrop(999, false);
+    }
+
+    function test_setGlobalPause_pauserCanPause() public {
+        vm.expectEmit(false, false, false, true);
+        emit ClaimModule.GlobalPauseSet(true);
+
+        vm.prank(pauser);
+        cm.setGlobalPause(true);
+        assertTrue(cm.globalPaused());
+    }
+
+    function test_setGlobalPause_revertsFromNonPauser() public {
+        vm.expectRevert();
+        vm.prank(attacker);
+        cm.setGlobalPause(true);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  5. VESTING MATH
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_vestedAmount_zeroBeforeCliff() public {
+        bytes32 leaf  = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root  = _singleLeafRoot(leaf);
+        uint256 start = block.timestamp + 10;
 
         vm.prank(admin);
-        // Call withdraw (sends 1 ether to 'admin')
-        claim.emergencyWithdraw(address(0), admin, amountToWithdraw);
-        
-        // Assert balance CHANGE of the contract
-        assertEq(contractBalanceBefore - address(claim).balance, amountToWithdraw, "ETH withdrawal change failed");
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, start, CLIFF, DURATION);
+
+        // Still before cliff
+        assertEq(cm.vestedAmount(AIRDROP_ID, ALLOCATION), 0);
+    }
+
+    function test_vestedAmount_linearMidway() public {
+        bytes32 leaf  = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root  = _singleLeafRoot(leaf);
+        uint256 start = block.timestamp + 10;
+
+        vm.prank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, start, 0, DURATION);
+
+        // Advance to start + 500 (50% of duration)
+        vm.warp(start + 500);
+
+        uint256 vested = cm.vestedAmount(AIRDROP_ID, ALLOCATION);
+        // Should be ~50% (500/1000 * ALLOCATION)
+        assertApproxEqAbs(vested, ALLOCATION / 2, 1 ether);
+    }
+
+    function test_vestedAmount_fullAfterDuration() public {
+        bytes32 leaf  = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root  = _singleLeafRoot(leaf);
+        uint256 start = block.timestamp + 10;
+
+        vm.prank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, start, 0, DURATION);
+
+        vm.warp(start + DURATION + 100);
+        assertEq(cm.vestedAmount(AIRDROP_ID, ALLOCATION), ALLOCATION);
+    }
+
+    function test_vestedAmount_instantFullyVested() public {
+        bytes32 leaf  = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root  = _singleLeafRoot(leaf);
+        uint256 start = block.timestamp + 5;
+
+        vm.prank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, start, 0, 0);
+
+        vm.warp(start + 1);
+        assertEq(cm.vestedAmount(AIRDROP_ID, ALLOCATION), ALLOCATION);
+    }
+
+    function test_vestedAmount_zeroAtExactCliffBoundary() public {
+        bytes32 leaf  = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root  = _singleLeafRoot(leaf);
+        uint256 start = block.timestamp + 10;
+
+        vm.prank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, start, CLIFF, DURATION);
+
+        // Exactly at cliff - 1 second: still 0
+        vm.warp(start + CLIFF - 1);
+        assertEq(cm.vestedAmount(AIRDROP_ID, ALLOCATION), 0);
+
+        // Exactly at cliff: linear kicks in
+        vm.warp(start + CLIFF);
+        assertGt(cm.vestedAmount(AIRDROP_ID, ALLOCATION), 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  6. SINGLE CLAIM — ERC-20
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_claim_erc20_transfersTokens() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        uint256 before = token.balanceOf(alice);
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ALLOCATION, 0, CATEGORY, proof);
+
+        assertEq(token.balanceOf(alice) - before, ALLOCATION);
+    }
+
+    function test_claim_erc20_emitsClaimedEvent() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        vm.expectEmit(true, true, false, true);
+        emit ClaimModule.Claimed(AIRDROP_ID, alice, ALLOCATION, 0);
+
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ALLOCATION, 0, CATEGORY, proof);
+    }
+
+    function test_claim_erc20_incrementsNonce() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ALLOCATION, 0, CATEGORY, proof);
+
+        assertEq(cm.nonces(AIRDROP_ID, alice), 1);
+    }
+
+    function test_claim_erc20_updatesClaimedMapping() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ALLOCATION, 0, CATEGORY, proof);
+
+        assertEq(cm.claimed(AIRDROP_ID, alice), ALLOCATION);
+    }
+
+    function test_claim_revertsInvalidAirdrop() public {
+        bytes32[] memory proof = new bytes32[](0);
+        vm.expectRevert(ClaimModule.InvalidAirdrop.selector);
+        vm.prank(alice);
+        cm.claim(999, ALLOCATION, 0, CATEGORY, proof);
+    }
+
+    function test_claim_revertsInvalidProof() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        // Bob uses Alice's proof — should fail
+        vm.expectRevert(ClaimModule.InvalidProof.selector);
+        vm.prank(bob);
+        cm.claim(AIRDROP_ID, ALLOCATION, 0, CATEGORY, proof);
+    }
+
+    function test_claim_revertsInvalidNonce() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ALLOCATION, 0, CATEGORY, proof);
+
+        // Try to replay with old nonce
+        vm.expectRevert(ClaimModule.InvalidNonce.selector);
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ALLOCATION, 0, CATEGORY, proof);
+    }
+
+    function test_claim_revertsWhenGloballyPaused() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        vm.prank(pauser);
+        cm.setGlobalPause(true);
+
+        vm.expectRevert(ClaimModule.GloballyPaused.selector);
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ALLOCATION, 0, CATEGORY, proof);
+    }
+
+    function test_claim_revertsWhenAirdropInactive() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        vm.prank(admin);
+        cm.toggleAirdrop(AIRDROP_ID, false);
+
+        vm.expectRevert(ClaimModule.AirdropNotActive.selector);
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ALLOCATION, 0, CATEGORY, proof);
+    }
+
+    function test_claim_revertsNothingToClaimBeforeVesting() public {
+        bytes32 leaf  = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root  = _singleLeafRoot(leaf);
+        bytes32[] memory proof = new bytes32[](0);
+        uint256 start = block.timestamp + 100;
+
+        vm.prank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, start, CLIFF, DURATION);
+
+        // Do NOT advance time — before start
+        vm.expectRevert(ClaimModule.NothingToClaim.selector);
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ALLOCATION, 0, CATEGORY, proof);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  7. SINGLE CLAIM — ETH
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_claim_eth_transfersNativeToken() public {
+        uint256 ethAlloc = 1 ether;
+        bytes32[] memory proof = _createEthAirdrop(AIRDROP_ID, alice, ethAlloc);
+
+        uint256 before = alice.balance;
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ethAlloc, 0, CATEGORY, proof);
+
+        assertEq(alice.balance - before, ethAlloc);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  8. PROGRESSIVE VESTING
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_progressiveVesting_twoPartialClaims() public {
+        bytes32 leaf0  = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 leaf1  = _leaf(alice, ALLOCATION, 1, CATEGORY);
+
+        // Build a two-leaf tree so both nonces are valid
+        (bytes32 root, bytes32 sibling0) = _twoLeafRoot(leaf0, leaf1);
+        bytes32[] memory proof0 = new bytes32[](1);
+        proof0[0] = sibling0;
+
+        uint256 start = block.timestamp + 10;
+        vm.prank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, start, 0, DURATION);
+
+        // ── Claim 1: at 25% ─────────────────────────────────────────────
+        vm.warp(start + 250);
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ALLOCATION, 0, CATEGORY, proof0);
+
+        uint256 firstClaim = cm.claimed(AIRDROP_ID, alice);
+        assertGt(firstClaim, 0);
+        assertLt(firstClaim, ALLOCATION);
+
+        // ── Claim 2 (nonce=1): at 75% ───────────────────────────────────
+        vm.warp(start + 750);
+
+        bytes32[] memory p1 = new bytes32[](1);
+        p1[0] = leaf0 < leaf1 ? leaf0 : leaf1;
+
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ALLOCATION, 1, CATEGORY, p1);
+
+        uint256 totalClaimed = cm.claimed(AIRDROP_ID, alice);
+        assertGt(totalClaimed, firstClaim);
+        assertLe(totalClaimed, ALLOCATION);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  9. BATCH CLAIM
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function _setupTwoInstantAirdrops()
+        internal
+        returns (
+            bytes32[] memory proofA,
+            bytes32[] memory proofB,
+            uint256 allocA,
+            uint256 allocB
+        )
+    {
+        allocA = 500 ether;
+        allocB = 300 ether;
+
+        uint256 start = block.timestamp + 5;
+
+        // Airdrop A
+        bytes32 leafA = _leaf(alice, allocA, 0, CATEGORY);
+        bytes32 rootA = _singleLeafRoot(leafA);
+        vm.prank(admin);
+        cm.createAirdrop(1, address(token), rootA, allocA, start, 0, 0);
+
+        // Airdrop B
+        bytes32 leafB = _leaf(alice, allocB, 0, CATEGORY);
+        bytes32 rootB = _singleLeafRoot(leafB);
+        vm.prank(admin);
+        cm.createAirdrop(2, address(token), rootB, allocB, start, 0, 0);
+
+        vm.warp(block.timestamp + 10);
+
+        proofA = new bytes32[](0);
+        proofB = new bytes32[](0);
+    }
+
+    function test_batchClaim_claimsFromMultipleAirdrops() public {
+        (
+            bytes32[] memory proofA,
+            bytes32[] memory proofB,
+            uint256 allocA,
+            uint256 allocB
+        ) = _setupTwoInstantAirdrops();
+
+        uint256[] memory ids       = new uint256[](2);
+        uint256[] memory allocs    = new uint256[](2);
+        uint256[] memory noncesArr = new uint256[](2);
+        uint256[] memory cats      = new uint256[](2);
+        bytes32[][] memory proofs  = new bytes32[][](2);
+
+        ids[0] = 1; ids[1] = 2;
+        allocs[0] = allocA; allocs[1] = allocB;
+        noncesArr[0] = 0; noncesArr[1] = 0;
+        cats[0] = CATEGORY; cats[1] = CATEGORY;
+        proofs[0] = proofA; proofs[1] = proofB;
+
+        uint256 before = token.balanceOf(alice);
+        vm.prank(alice);
+        cm.batchClaim(ids, allocs, noncesArr, cats, proofs);
+
+        assertEq(token.balanceOf(alice) - before, allocA + allocB);
+    }
+
+    function test_batchClaim_emitsBatchClaimedEvent() public {
+        (
+            bytes32[] memory proofA,
+            bytes32[] memory proofB,
+            uint256 allocA,
+            uint256 allocB
+        ) = _setupTwoInstantAirdrops();
+
+        uint256[] memory ids       = new uint256[](2);
+        uint256[] memory allocs    = new uint256[](2);
+        uint256[] memory noncesArr = new uint256[](2);
+        uint256[] memory cats      = new uint256[](2);
+        bytes32[][] memory proofs  = new bytes32[][](2);
+
+        ids[0] = 1; ids[1] = 2;
+        allocs[0] = allocA; allocs[1] = allocB;
+        noncesArr[0] = 0; noncesArr[1] = 0;
+        cats[0] = CATEGORY; cats[1] = CATEGORY;
+        proofs[0] = proofA; proofs[1] = proofB;
+
+        vm.expectEmit(true, false, false, false);
+        emit ClaimModule.BatchClaimed(alice, ids, allocs);
+
+        vm.prank(alice);
+        cm.batchClaim(ids, allocs, noncesArr, cats, proofs);
+    }
+
+    function test_batchClaim_revertsDuplicateId() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        uint256[] memory ids       = new uint256[](2);
+        uint256[] memory allocs    = new uint256[](2);
+        uint256[] memory noncesArr = new uint256[](2);
+        uint256[] memory cats      = new uint256[](2);
+        bytes32[][] memory proofs  = new bytes32[][](2);
+
+        ids[0] = AIRDROP_ID; ids[1] = AIRDROP_ID; // duplicate!
+        allocs[0] = ALLOCATION; allocs[1] = ALLOCATION;
+        noncesArr[0] = 0; noncesArr[1] = 0;
+        cats[0] = CATEGORY; cats[1] = CATEGORY;
+        proofs[0] = proof; proofs[1] = proof;
+
+        vm.expectRevert(
+            abi.encodeWithSelector(ClaimModule.DuplicateIdInBatch.selector, AIRDROP_ID)
+        );
+        vm.prank(alice);
+        cm.batchClaim(ids, allocs, noncesArr, cats, proofs);
+    }
+
+    function test_batchClaim_revertsEmptyBatch() public {
+        uint256[] memory ids       = new uint256[](0);
+        uint256[] memory allocs    = new uint256[](0);
+        uint256[] memory noncesArr = new uint256[](0);
+        uint256[] memory cats      = new uint256[](0);
+        bytes32[][] memory proofs  = new bytes32[][](0);
+
+        vm.expectRevert(ClaimModule.BatchSizeExceeded.selector);
+        vm.prank(alice);
+        cm.batchClaim(ids, allocs, noncesArr, cats, proofs);
+    }
+
+    function test_batchClaim_revertsMismatchedArrayLengths() public {
+        uint256[] memory ids       = new uint256[](2);
+        uint256[] memory allocs    = new uint256[](1); // mismatch
+        uint256[] memory noncesArr = new uint256[](2);
+        uint256[] memory cats      = new uint256[](2);
+        bytes32[][] memory proofs  = new bytes32[][](2);
+
+        vm.expectRevert(ClaimModule.BatchLengthMismatch.selector);
+        vm.prank(alice);
+        cm.batchClaim(ids, allocs, noncesArr, cats, proofs);
+    }
+
+    function test_batchClaim_revertsWhenGloballyPaused() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        vm.prank(pauser);
+        cm.setGlobalPause(true);
+
+        uint256[] memory ids       = new uint256[](1);
+        uint256[] memory allocs    = new uint256[](1);
+        uint256[] memory noncesArr = new uint256[](1);
+        uint256[] memory cats      = new uint256[](1);
+        bytes32[][] memory proofs  = new bytes32[][](1);
+
+        ids[0] = AIRDROP_ID; allocs[0] = ALLOCATION;
+        noncesArr[0] = 0; cats[0] = CATEGORY; proofs[0] = proof;
+
+        vm.expectRevert(ClaimModule.GloballyPaused.selector);
+        vm.prank(alice);
+        cm.batchClaim(ids, allocs, noncesArr, cats, proofs);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  10. EMERGENCY WITHDRAW
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_emergencyWithdraw_erc20() public {
+        uint256 amount = 50 ether;
+        uint256 before = token.balanceOf(admin);
+
+        vm.prank(admin);
+        cm.emergencyWithdraw(address(token), admin, amount);
+
+        assertEq(token.balanceOf(admin) - before, amount);
+    }
+
+    function test_emergencyWithdraw_eth() public {
+        uint256 amount = 1 ether;
+        uint256 before = admin.balance;
+
+        vm.prank(admin);
+        cm.emergencyWithdraw(address(0), admin, amount);
+
+        assertEq(admin.balance - before, amount);
+    }
+
+    function test_emergencyWithdraw_emitsEvent() public {
+        vm.expectEmit(true, true, false, true);
+        emit ClaimModule.EmergencyWithdraw(address(token), admin, 1 ether);
+
+        vm.prank(admin);
+        cm.emergencyWithdraw(address(token), admin, 1 ether);
+    }
+
+    function test_emergencyWithdraw_revertsFromNonAdmin() public {
+        vm.expectRevert();
+        vm.prank(attacker);
+        cm.emergencyWithdraw(address(token), attacker, 1 ether);
+    }
+
+    function test_emergencyWithdraw_revertsZeroAddress() public {
+        vm.expectRevert(ClaimModule.ZeroAddress.selector);
+        vm.prank(admin);
+        cm.emergencyWithdraw(address(token), address(0), 1 ether);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  11. getClaimableAmount VIEW
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_getClaimableAmount_returnsFullForUnclaimedValidProof() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        uint256 claimable = cm.getClaimableAmount(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY, proof);
+        assertEq(claimable, ALLOCATION);
+    }
+
+    function test_getClaimableAmount_returnsZeroAfterFullClaim() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ALLOCATION, 0, CATEGORY, proof);
+
+        uint256 claimable = cm.getClaimableAmount(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY, proof);
+        assertEq(claimable, 0);
+    }
+
+    function test_getClaimableAmount_returnsZeroForInvalidProof() public {
+        _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        bytes32[] memory badProof = new bytes32[](0);
+        uint256 claimable = cm.getClaimableAmount(AIRDROP_ID, bob, ALLOCATION, 0, CATEGORY, badProof);
+        assertEq(claimable, 0);
+    }
+
+    function test_getClaimableAmount_returnsZeroWhenPaused() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        vm.prank(pauser);
+        cm.setGlobalPause(true);
+
+        uint256 claimable = cm.getClaimableAmount(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY, proof);
+        assertEq(claimable, 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  12. SECURITY
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_security_attackerCannotUseStolenProof() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        // Attacker tries Alice's proof with their own address
+        vm.expectRevert(ClaimModule.InvalidProof.selector);
+        vm.prank(attacker);
+        cm.claim(AIRDROP_ID, ALLOCATION, 0, CATEGORY, proof);
+    }
+
+    function test_security_replayAttackRejected() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ALLOCATION, 0, CATEGORY, proof);
+
+        vm.expectRevert(ClaimModule.InvalidNonce.selector);
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ALLOCATION, 0, CATEGORY, proof);
+    }
+
+    function test_security_reusedRootRejectedOnNewAirdrop() public {
+        bytes32 leaf = _leaf(alice, ALLOCATION, 0, CATEGORY);
+        bytes32 root = _singleLeafRoot(leaf);
+        uint256 start = block.timestamp + 60;
+
+        vm.startPrank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, ALLOCATION, start, 0, 0);
+
+        vm.expectRevert(ClaimModule.RootAlreadyUsed.selector);
+        cm.createAirdrop(2, address(token), root, ALLOCATION, start, 0, 0);
+        vm.stopPrank();
+    }
+
+    function test_security_wrongAllocationRejected() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        // Alice tries to claim more than her allocation
+        vm.expectRevert(ClaimModule.InvalidProof.selector);
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ALLOCATION * 2, 0, CATEGORY, proof);
+    }
+
+    function test_security_wrongCategoryRejected() public {
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, ALLOCATION, 0, CATEGORY);
+
+        vm.expectRevert(ClaimModule.InvalidProof.selector);
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, ALLOCATION, 0, CATEGORY + 1, proof);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  13. FUZZ TESTS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function testFuzz_createAirdrop_uniqueIds(uint256 idA, uint256 idB) public {
+        vm.assume(idA != 0 && idB != 0 && idA != idB);
+
+        bytes32 leafA = _leaf(alice, ALLOCATION, 0, 1);
+        bytes32 rootA = _singleLeafRoot(leafA);
+        bytes32 leafB = _leaf(bob, ALLOCATION, 0, 2);
+        bytes32 rootB = _singleLeafRoot(leafB);
+
+        uint256 start = block.timestamp + 60;
+
+        vm.startPrank(admin);
+        cm.createAirdrop(idA, address(token), rootA, ALLOCATION, start, 0, 0);
+        cm.createAirdrop(idB, address(token), rootB, ALLOCATION, start, 0, 0);
+        vm.stopPrank();
+
+        assertTrue(cm.exists(idA));
+        assertTrue(cm.exists(idB));
+    }
+
+    function testFuzz_vestedAmount_neverExceedsAllocation(
+        uint256 elapsed,
+        uint256 alloc
+    ) public {
+        alloc   = bound(alloc,   1 ether, 1_000_000 ether);
+        elapsed = bound(elapsed, 0,       10_000);
+
+        bytes32 leaf  = _leaf(alice, alloc, 0, CATEGORY);
+        bytes32 root  = _singleLeafRoot(leaf);
+        uint256 start = block.timestamp + 10;
+
+        vm.prank(admin);
+        cm.createAirdrop(AIRDROP_ID, address(token), root, alloc, start, 0, DURATION);
+
+        vm.warp(start + elapsed);
+        uint256 vested = cm.vestedAmount(AIRDROP_ID, alloc);
+        assertLe(vested, alloc);
+    }
+
+    function testFuzz_claim_cannotClaimMoreThanAllocation(uint256 alloc) public {
+        alloc = bound(alloc, 1 ether, 100_000 ether);
+
+        (, bytes32[] memory proof) = _createInstantAirdrop(AIRDROP_ID, alice, alloc, 0, CATEGORY);
+
+        vm.prank(alice);
+        cm.claim(AIRDROP_ID, alloc, 0, CATEGORY, proof);
+
+        // claimed must never exceed allocation
+        assertLe(cm.claimed(AIRDROP_ID, alice), alloc);
     }
 }
