@@ -413,11 +413,10 @@ contract MilestoneVestingTest is Test {
 
         // Fast forward 366 days (past 12 month deadline)
         vm.warp(block.timestamp + 366 days);
-
+        vm.expectEmit(true, false, false, false);
+        emit MilestoneVesting.MilestoneCancelled(0, "Deadline passed, milestone not achieved");
         mv.cancelMilestone(0, "Deadline passed, milestone not achieved");
 
-        vm.expectEmit(true, false, false, false);
-        // just check it doesn't revert
     }
 
     function test_RevertCancelIfDeadlineNotPassed() public {

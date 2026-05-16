@@ -606,7 +606,7 @@ contract ClaimModuleTest is Test {
         vm.warp(start + 750);
 
         bytes32[] memory p1 = new bytes32[](1);
-        p1[0] = leaf0 < leaf1 ? leaf0 : leaf1;
+        p1[0] = leaf0;
 
         vm.prank(alice);
         cm.claim(AIRDROP_ID, ALLOCATION, 1, CATEGORY, p1);

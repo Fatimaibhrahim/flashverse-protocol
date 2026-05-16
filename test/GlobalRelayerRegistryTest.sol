@@ -71,26 +71,17 @@ contract GlobalRelayerRegistryTest is Test {
         uint256 insufficientBalance = minStake / 2; 
 
         // 1. Burn tokens to reduce relayer's balance
-        vm.prank(relayer);  
+        vm.startPrank(relayer);  
         uint256 amountToBurn = stakeToken.balanceOf(relayer) - insufficientBalance;
         stakeToken.burn(amountToBurn);  
+        vm.stopPrank();
 
-        // 2. CRITICAL FIX: The relayer MUST approve MIN_STAKE to pass the allowance check
-        vm.prank(relayer);  
-        stakeToken.approve(address(registry), minStake); // <--- THIS LINE IS KEY
-
-        // 3. Final call, expecting InsufficientStake 
-        vm.prank(relayer);  
-        vm.expectRevert(  
-            abi.encodeWithSelector(  
-                InsufficientStake.selector, // Use direct name as per last compiler fix
-                minStake, 
-                stakeToken.balanceOf(relayer) 
-            )  
-        );  
-        registry.addRelayer(1, 1);  
-    }  
-
+        vm.startPrank(relayer);
+        stakeToken.approve(address(registry), minStake);
+        vm.expectRevert(abi.encodeWithSelector(bytes4(keccak256("InsufficientStake(uint256,uint256)")), minStake, stakeToken.balanceOf(relayer)));
+        registry.addRelayer(1, 1);
+        vm.stopPrank();
+    }
     /* -------------------------  
        stakeMore 
        ------------------------- */  

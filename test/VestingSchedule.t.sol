@@ -98,7 +98,9 @@ contract VestingScheduleTest is Test {
         
         // FIX: Using local variables to perform division at runtime, 
         // avoiding the 'rational_const' compile error.
-        uint256 expected = (total * timePassed) / duration; 
+        uint256 elapsed = timePassed - 30 days;
+        uint256 vestingPeriod = duration - 30 days;
+        uint256 expected = (total * elapsed) / vestingPeriod;
         assertEq(balance, expected);
     }
 
@@ -224,7 +226,7 @@ contract VestingScheduleTest is Test {
 
     function testOnlyOwnerCanCreate() public {
         vm.prank(alice);
-        vm.expectRevert("Ownable: caller is not the owner");
+        vm.expectRevert(abi.encodeWithSelector(bytes4(keccak256("OwnableUnauthorizedAccount(address)")), alice));
         vesting.createVesting(alice, 1_000 ether, uint64(block.timestamp + 1), 0, 100 days);
     }
 

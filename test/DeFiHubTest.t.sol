@@ -12,9 +12,8 @@ import "forge-std/Test.sol";
 import "../src/DeFiHub.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
 
-// ── Mock DEX Adapter ──────────────────────────────────────────────────────────
 contract MockDEXAdapter {
-    function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut, address to)
+        function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut, address to)
         external returns (uint256)
     {
         IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn);
@@ -510,9 +509,13 @@ contract DeFiHubTest is Test {
     }
 
     function test_RevertRewardRateAboveMax() public {
+        uint256 tooHigh = hub.MAX_REWARD_RATE() + 1;
         vm.expectRevert(abi.encodeWithSelector(InvalidAmount.selector, 0, hub.MAX_REWARD_RATE()));
-        hub.queueRewardRateUpdate(hub.MAX_REWARD_RATE() + 1);
+        hub.queueRewardRateUpdate(tooHigh);
     }
+
+
+
 
     // ─────────────────────────────────────────
     //  8. Admin operations
@@ -537,7 +540,7 @@ contract DeFiHubTest is Test {
         MockERC20 random = new MockERC20("R", "R", 1_000 ether);
         random.transfer(address(hub), 500 ether);
         hub.rescueTokens(address(random), 500 ether);
-        assertEq(random.balanceOf(owner), 500 ether);
+        assertEq(random.balanceOf(owner), 1_000 ether);
     }
 
     function test_RevertRescueProtectedToken() public {
